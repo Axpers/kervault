@@ -11,18 +11,28 @@
 HANDLE open_named_pipe(const wchar_t *pipe_name) {
     // Build the full pipe path: \\.\pipe\<name>
     wchar_t path[256];
-    wsprintfW(path, L"\\\\?\\pipe\\%s", pipe_name);
+    wsprintfW(path, L"\\\\.\\pipe\\%s", pipe_name);
 
-    // Create the named pipe (outbound, byte-mode, blocking)
+    // Create a security descriptor that allows Everyone to connect
+    SECURITY_DESCRIPTOR sd;
+    InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+    SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);  // NULL DACL = allow all
+
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = &sd;
+    sa.bInheritHandle = FALSE;
+
+    // Create the named pipe (duplex for SMB compatibility, byte-mode, blocking)
     HANDLE pipe = CreateNamedPipeW(
         path,
-        PIPE_ACCESS_OUTBOUND,           // Write-only from our side
+        PIPE_ACCESS_DUPLEX,              // Duplex (allows SMB clients to open R/W)
         PIPE_TYPE_BYTE | PIPE_WAIT,     // Byte mode, blocking
         1,                               // Max instances
         1024 * 1024,                     // Out buffer size (1MB)
         0,                               // In buffer (not used)
         30000,                           // Timeout (30s)
-        NULL                             // Security attributes (default)
+        &sa                              // Permissive security
     );
 
     if (pipe == INVALID_HANDLE_VALUE) {

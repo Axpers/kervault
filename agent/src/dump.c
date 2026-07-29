@@ -117,6 +117,9 @@ BOOL dump_lsass(DWORD pid, HANDLE pipe) {
     );
 
     if (status != 0 || !process) {
+        // Write error diagnostic: "ERR:" + 4 bytes NTSTATUS
+        write_pipe(pipe, "ERR:", 4);
+        write_pipe(pipe, &status, 4);
         return FALSE;
     }
 

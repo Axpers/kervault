@@ -172,6 +172,10 @@ def parse(data: bytes) -> Minidump:
         elif stream.stream_type == STREAM_MEMORY64_LIST:
             _parse_memory64_list(data, stream.rva, dump)
 
+    # If no modules found via stream, discover from PE headers in memory
+    if not dump.modules and dump.memory:
+        _discover_modules_from_pe(dump)
+
     return dump
 
 
@@ -261,3 +265,52 @@ def _read_minidump_string(data: bytes, rva: int) -> str:
     byte_len = struct.unpack_from("<I", data, rva)[0]
     raw = data[rva + 4 : rva + 4 + byte_len]
     return raw.decode("utf-16-le", errors="replace").rstrip("\x00")
+
+
+def _discover_modules_from_pe(dump: Minidump):
+    """Discover modules by scanning memory segments for PE headers (MZ+PE signature).
+
+    Used as fallback when the dump has no ModuleList stream (e.g. custom dumpers).
+    """
+    for seg in dump.memory:
+        if len(seg.data) < 0x200 or seg.data[:2] != b"MZ":
+            continue
+
+        pe_off_data = dump.read_memory(seg.start + 0x3C, 4)
+        if not pe_off_data:
+            continue
+        pe_off = struct.unpack_from("<I", pe_off_data)[0]
+        pe_sig = dump.read_memory(seg.start + pe_off, 4)
+        if not pe_sig or pe_sig != b"PE\x00\x00":
+            continue
+
+        opt_off = seg.start + pe_off + 24
+        opt_data = dump.read_memory(opt_off, 0x78)
+        if not opt_data or len(opt_data) < 0x78:
+            continue
+
+        magic = struct.unpack_from("<H", opt_data)[0]
+        if magic == 0x20B:  # PE32+
+            size_of_image = struct.unpack_from("<I", opt_data, 0x38)[0]
+            export_rva = struct.unpack_from("<I", opt_data, 0x70)[0]
+        elif magic == 0x10B:  # PE32
+            size_of_image = struct.unpack_from("<I", opt_data, 0x38)[0]
+            export_rva = struct.unpack_from("<I", opt_data, 0x60)[0]
+        else:
+            continue
+
+        name = ""
+        if export_rva:
+            export_dir = dump.read_memory(seg.start + export_rva, 40)
+            if export_dir and len(export_dir) >= 16:
+                name_rva = struct.unpack_from("<I", export_dir, 12)[0]
+                if name_rva:
+                    name_data = dump.read_memory(seg.start + name_rva, 128)
+                    if name_data:
+                        name = name_data.split(b"\x00")[0].decode("ascii", errors="replace")
+
+        dump.modules.append(ModuleEntry(
+            base_address=seg.start,
+            size=size_of_image,
+            name=name,
+        ))

@@ -121,6 +121,10 @@ class RegistrySecrets:
             # Get SAM F value (contains encryption metadata)
             sam_account = reg.open_key(hklm, r"SAM\SAM\Domains\Account")
             _, f_value = reg.query_value(sam_account, "F")
+            if not f_value or len(f_value) < 0x70:
+                reg.close_key(sam_account)
+                reg.close_key(hklm)
+                raise RuntimeError("Cannot read SAM F value (access restricted by OS)")
             hashed_boot_key = compute_hashed_boot_key(self._boot_key, f_value)
 
             # Determine SAM revision

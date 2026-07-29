@@ -10,22 +10,44 @@ Reference: [C706] DCE/RPC NDR specification
 
 import struct
 
+# Auto-incrementing referent ID counter
+_referent_id = 0x00020000
+
+
+def _next_referent() -> int:
+    global _referent_id
+    _referent_id += 4
+    return _referent_id
+
 
 def ndr_wstring(s: str) -> bytes:
-    """Encode a null-terminated wide string (conformant+varying LPWSTR).
+    """Encode a unique pointer to a null-terminated wide string (conformant+varying LPWSTR).
 
-    NDR format:
+    NDR format (unique pointer — inline, for simple cases):
         [Referent ID: 4 bytes]
         [Max count: 4 bytes]   = len + 1 (including null)
         [Offset: 4 bytes]      = 0
         [Actual count: 4 bytes] = len + 1
         [UTF-16LE data + null terminator, padded to 4-byte boundary]
     """
-    encoded = (s + "\x00").encode("utf-16-le")
-    char_count = len(s) + 1  # including null
+    ref = struct.pack("<I", _next_referent())
+    return ref + ndr_wstring_data(s)
 
-    result = struct.pack("<I", 0x00020000)  # referent pointer ID
-    result += struct.pack("<III", char_count, 0, char_count)
+
+def ndr_wstring_ref() -> bytes:
+    """Emit just a non-NULL referent ID (4 bytes) for deferred encoding."""
+    return struct.pack("<I", _next_referent())
+
+
+def ndr_wstring_data(s: str) -> bytes:
+    """Encode the conformant+varying string body (without referent ID).
+
+    Used for deferred pointer data.
+    """
+    encoded = (s + "\x00").encode("utf-16-le")
+    char_count = len(s) + 1
+
+    result = struct.pack("<III", char_count, 0, char_count)
     result += encoded
 
     # Pad to 4-byte alignment
@@ -51,22 +73,9 @@ def ndr_handle(handle: bytes) -> bytes:
     return handle
 
 
-def ndr_lpbyte(data: bytes | None) -> bytes:
-    """Encode LPBYTE (pointer to conformant byte array)."""
-    if data is None:
-        return struct.pack("<I", 0)  # NULL pointer
-
-    result = struct.pack("<I", 0x00020004)  # referent ID
-    result += struct.pack("<I", len(data))  # max count
-    result += struct.pack("<I", 0)  # offset
-    result += struct.pack("<I", len(data))  # actual count
-    result += data
-
-    # Pad to 4-byte alignment
-    if len(data) % 4 != 0:
-        result += b"\x00" * (4 - len(data) % 4)
-
-    return result
+def ndr_lpbyte_null() -> bytes:
+    """Encode a NULL LPBYTE pointer."""
+    return struct.pack("<I", 0)
 
 
 def parse_context_handle(data: bytes, offset: int = 0) -> tuple[bytes, int]:

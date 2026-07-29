@@ -13,9 +13,12 @@ from ..smb import PipeIO
 from .core import build_bind, build_request, parse_response
 from .ndr import (
     ndr_wstring,
+    ndr_wstring_ref,
+    ndr_wstring_data,
     ndr_wstring_null,
     ndr_dword,
     ndr_handle,
+    ndr_lpbyte_null,
     parse_context_handle,
     parse_dword,
 )
@@ -34,6 +37,10 @@ OPNUM_OPEN_SC_MANAGER_W = 15
 OPNUM_OPEN_SERVICE_W = 16
 OPNUM_START_SERVICE_W = 19
 OPNUM_CREATE_SERVICE_W = 12
+OPNUM_QUERY_SERVICE_STATUS_EX = 40
+
+# QueryServiceStatusEx info levels
+SC_STATUS_PROCESS_INFO = 0
 
 # Access masks
 SC_MANAGER_ALL_ACCESS = 0x000F003F
@@ -102,21 +109,23 @@ class SvcCtl:
             raise RuntimeError("Must call open_sc_manager() first")
 
         # [MS-SCMR] 3.1.4.12 RCreateServiceW
+        # lpServiceName and lpBinaryPathName are ref pointers (no referent ID)
+        # lpDisplayName and others are unique pointers (with referent ID)
         stub = ndr_handle(self._scm_handle)
-        stub += ndr_wstring(service_name)
-        stub += ndr_wstring(display_name)      # lpDisplayName (referent)
-        stub += ndr_dword(SERVICE_ALL_ACCESS)   # dwDesiredAccess
+        stub += ndr_wstring_data(service_name)        # lpServiceName (ref)
+        stub += ndr_wstring(display_name)             # lpDisplayName (unique)
+        stub += ndr_dword(SERVICE_ALL_ACCESS)         # dwDesiredAccess
         stub += ndr_dword(SERVICE_WIN32_OWN_PROCESS)  # dwServiceType
         stub += ndr_dword(SERVICE_DEMAND_START)       # dwStartType
         stub += ndr_dword(SERVICE_ERROR_IGNORE)       # dwErrorControl
-        stub += ndr_wstring(binary_path)        # lpBinaryPathName
-        stub += ndr_wstring_null()              # lpLoadOrderGroup
-        stub += ndr_dword(0)                    # lpdwTagId (NULL)
-        stub += ndr_lpbyte_null()               # lpDependencies
-        stub += ndr_dword(0)                    # dwDependSize
-        stub += ndr_wstring_null()              # lpServiceStartName (LocalSystem)
-        stub += ndr_lpbyte_null()               # lpPassword
-        stub += ndr_dword(0)                    # dwPwSize
+        stub += ndr_wstring_data(binary_path)         # lpBinaryPathName (ref)
+        stub += ndr_wstring_null()                    # lpLoadOrderGroup (NULL)
+        stub += ndr_dword(0)                          # lpdwTagId (NULL)
+        stub += ndr_lpbyte_null()                     # lpDependencies (NULL)
+        stub += ndr_dword(0)                          # dwDependSize
+        stub += ndr_wstring_null()                    # lpServiceStartName (NULL)
+        stub += ndr_lpbyte_null()                     # lpPassword (NULL)
+        stub += ndr_dword(0)                          # dwPwSize
 
         resp = self._call(OPNUM_CREATE_SERVICE_W, stub)
 
@@ -131,15 +140,12 @@ class SvcCtl:
         return handle
 
     def open_service(self, service_name: str) -> bytes:
-        """ROpenServiceW — open an existing service by name.
-
-        Returns the 20-byte service context handle.
-        """
+        """ROpenServiceW — open an existing service by name."""
         if not self._scm_handle:
             raise RuntimeError("Must call open_sc_manager() first")
 
         stub = ndr_handle(self._scm_handle)
-        stub += ndr_wstring(service_name)
+        stub += ndr_wstring_data(service_name)
         stub += ndr_dword(SERVICE_ALL_ACCESS)
 
         resp = self._call(OPNUM_OPEN_SERVICE_W, stub)
@@ -150,6 +156,37 @@ class SvcCtl:
             raise RuntimeError(f"OpenServiceW failed: 0x{status:08X}")
 
         return handle
+
+    def query_service_pid(self, service_handle: bytes) -> int:
+        """RQueryServiceStatusEx — get the PID of a service's host process."""
+        stub = ndr_handle(service_handle)
+        stub += ndr_dword(SC_STATUS_PROCESS_INFO)  # InfoLevel
+        stub += ndr_dword(36)                       # cbBufSize (SERVICE_STATUS_PROCESS = 36 bytes)
+
+        resp = self._call(OPNUM_QUERY_SERVICE_STATUS_EX, stub)
+
+        # Response: lpBuffer (array) + pcbBytesNeeded(4) + ReturnValue(4)
+        # SERVICE_STATUS_PROCESS layout:
+        #   dwServiceType(4) + dwCurrentState(4) + dwControlsAccepted(4)
+        #   + dwWin32ExitCode(4) + dwServiceSpecificExitCode(4)
+        #   + dwCheckPoint(4) + dwWaitHint(4) + dwProcessId(4) + dwServiceFlags(4)
+        # The buffer is preceded by its size (4 bytes)
+        buf_size, offset = parse_dword(resp, 0)
+        # Skip to dwProcessId at offset 28 within the buffer
+        pid, _ = parse_dword(resp, offset + 28)
+
+        # Check return value (after buffer + pcbBytesNeeded)
+        ret_offset = offset + buf_size
+        # Align to 4 bytes
+        if ret_offset % 4 != 0:
+            ret_offset += 4 - (ret_offset % 4)
+        needed, ret_offset = parse_dword(resp, ret_offset)
+        status, _ = parse_dword(resp, ret_offset)
+
+        if status != 0:
+            raise RuntimeError(f"QueryServiceStatusEx failed: 0x{status:08X}")
+
+        return pid
 
     def start_service(self, service_handle: bytes) -> None:
         """RStartServiceW — start a service."""
@@ -197,8 +234,3 @@ class SvcCtl:
     def _next_call_id(self) -> int:
         self._call_id += 1
         return self._call_id
-
-
-def ndr_lpbyte_null() -> bytes:
-    """Null LPBYTE pointer."""
-    return struct.pack("<I", 0)

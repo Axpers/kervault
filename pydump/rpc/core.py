@@ -87,7 +87,7 @@ def parse_response(data: bytes) -> RpcResponse:
     if len(data) < 24:
         raise RuntimeError(f"RPC response too short: {len(data)} bytes")
 
-    version, ptype, flags, _, _, frag_length, _, call_id = struct.unpack_from(
+    _, _, ptype, flags, _, frag_length, _, call_id = struct.unpack_from(
         "<BBBBIHHI", data, 0
     )
 

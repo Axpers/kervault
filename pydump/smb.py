@@ -1,10 +1,9 @@
-"""SMB session management — wraps smbprotocol for our specific needs.
+"""SMB session management — wraps smbprotocol for remote operations.
 
 Provides:
 - NTLM/Kerberos authentication to a remote Windows host
 - Named pipe I/O (for DCE/RPC transport)
-- File read / write / delete on remote shares
-- Process ID discovery via remote registry or WMI
+- File read / delete on remote shares
 """
 
 import uuid
@@ -38,7 +37,7 @@ class SmbSession:
         self._trees: dict[str, TreeConnect] = {}
 
     def connect(self) -> None:
-        conn_id = str(uuid.uuid4())
+        conn_id = uuid.uuid4()
         self._conn = Connection(conn_id, self.target, port=445)
         self._conn.connect()
 
@@ -111,7 +110,12 @@ class SmbSession:
             data = b""
             offset = 0
             while True:
-                chunk = fh.read(offset, 65536)
+                try:
+                    chunk = fh.read(offset, 65536)
+                except Exception as e:
+                    if "STATUS_END_OF_FILE" in str(e) or "EndOfFile" in type(e).__name__:
+                        break
+                    raise
                 if not chunk:
                     break
                 data += chunk
@@ -135,30 +139,6 @@ class SmbSession:
             | CreateOptions.FILE_NON_DIRECTORY_FILE,
         )
         fh.close(get_attributes=False)
-
-    def write_file(self, share: str, path: str, data: bytes) -> None:
-        """Write data to a file on a remote share (overwrite if exists)."""
-        tree = self.tree_connect(share)
-
-        fh = Open(tree, path)
-        fh.create(
-            impersonation_level=ImpersonationLevel.Impersonation,
-            desired_access=FilePipePrinterAccessMask.GENERIC_WRITE,
-            file_attributes=FileAttributes.FILE_ATTRIBUTE_NORMAL,
-            share_access=0,
-            create_disposition=CreateDisposition.FILE_OVERWRITE_IF,
-            create_options=CreateOptions.FILE_NON_DIRECTORY_FILE,
-        )
-
-        try:
-            # Write in 64KB chunks
-            offset = 0
-            while offset < len(data):
-                chunk = data[offset : offset + 65536]
-                fh.write(chunk, offset)
-                offset += len(chunk)
-        finally:
-            fh.close(get_attributes=False)
 
     def __enter__(self):
         self.connect()

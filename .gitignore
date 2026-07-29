@@ -1,0 +1,42 @@
+# Virtual environment
+env/
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+*.dist-info/
+
+# Editable install artifacts
+__editable__*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dumps (never commit credential dumps)
+*.dmp
+*.dump
+*.mdmp
+
+# Compiled agent payloads
+agent/build/
+agent/bin/
+*.exe
+*.dll
+*.o
+*.obj
+*.bin
+*.shellcode

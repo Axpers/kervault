@@ -16,7 +16,6 @@ The extraction follows the same logic as pypykatz/mimikatz:
 """
 
 import struct
-import hashlib
 from dataclasses import dataclass
 
 from .minidump import Minidump

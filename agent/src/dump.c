@@ -270,7 +270,7 @@ BOOL dump_lsass(DWORD pid, HANDLE pipe) {
     di++;
     if (module_count > 0) {
         dirs[di].StreamType = STREAM_MODULE_LIST;
-        dirs[di].DataSize = module_list_size + module_names_size;
+        dirs[di].DataSize = module_list_size;
         dirs[di].Rva = modlist_rva;
         di++;
     }

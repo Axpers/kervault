@@ -13,7 +13,6 @@ from ..smb import PipeIO
 from .core import build_bind, build_request, parse_response
 from .ndr import (
     ndr_wstring,
-    ndr_wstring_ref,
     ndr_wstring_data,
     ndr_wstring_null,
     ndr_dword,

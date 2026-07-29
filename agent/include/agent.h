@@ -24,14 +24,4 @@ void close_pipe(HANDLE pipe);
 // LSASS dump
 BOOL dump_lsass(DWORD pid, HANDLE pipe);
 
-// MiniDump builder
-typedef struct _MDMP_BUILDER {
-    HANDLE process;
-    DWORD pid;
-    HANDLE pipe;
-    DWORD stream_count;
-} MDMP_BUILDER;
-
-BOOL mdmp_build_and_stream(MDMP_BUILDER *builder);
-
 #endif // AGENT_H

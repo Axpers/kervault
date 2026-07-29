@@ -43,7 +43,6 @@ class Credential:
     ntlm_hash: str = ""
     sha1_hash: str = ""
     password: str = ""
-    protected: bool = False  # True if Credential Guard (VBS) protects the hash
 
 
 @dataclass

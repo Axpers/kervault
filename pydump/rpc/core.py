@@ -9,7 +9,6 @@ Reference: [MS-RPCE] https://docs.microsoft.com/en-us/openspecs/windows_protocol
 """
 
 import struct
-import os
 from dataclasses import dataclass
 
 # PDU types

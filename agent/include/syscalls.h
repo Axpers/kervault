@@ -4,6 +4,16 @@
 #include <windows.h>
 #include "ntdefs.h"
 
+// DJB2 hashes of Nt* function names (no plaintext strings in binary)
+#define H_NtOpenProcess              0x5003C058
+#define H_NtClose                    0x8B8E133D
+#define H_NtQueryVirtualMemory       0xE39D8E5D
+#define H_NtReadVirtualMemory        0xC24062E3
+#define H_NtQueryInformationProcess  0xD034FC62
+#define H_NtCreateFile               0x15A5ECDB
+#define H_NtWriteFile                0xD69326B2
+#define H_NtQuerySystemInformation   0xEE4F73A8
+
 // Syscall numbers (resolved at runtime via Hell's Gate)
 typedef struct _SYSCALL_TABLE {
     DWORD NtOpenProcess;

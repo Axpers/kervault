@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pydump"
+version = "0.2.0"
+description = "Remote Windows credential extraction tool"
+requires-python = ">=3.11"
+dependencies = [
+    "smbprotocol>=1.13.0",
+    "pycryptodome>=3.19",
+    "impacket>=0.11",
+]
+
+[project.scripts]
+pydump = "pydump.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["pydump*"]

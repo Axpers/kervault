@@ -2,6 +2,7 @@
 #define SYSCALLS_H
 
 #include <windows.h>
+#include "ntdefs.h"
 
 // Syscall numbers (resolved at runtime via Hell's Gate)
 typedef struct _SYSCALL_TABLE {

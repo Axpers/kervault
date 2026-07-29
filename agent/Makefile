@@ -60,7 +60,7 @@ clean:
 
 CROSS_CC = x86_64-w64-mingw32-gcc
 CROSS_CFLAGS = -O1 -s -nostdlib -Iinclude -Wall
-CROSS_LDFLAGS = -lkernel32 -lntdll -e main_entry
+CROSS_LDFLAGS = -nostartfiles -lkernel32 -lntdll -e main_entry
 
 cross: dirs_cross
 	nasm -f win64 src/syscalls.asm -o build/syscalls_asm.o 2>/dev/null || \

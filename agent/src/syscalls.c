@@ -13,7 +13,7 @@
  */
 
 #include <windows.h>
-#include <winternl.h>
+#include "../include/ntdefs.h"
 #include "../include/syscalls.h"
 
 SYSCALL_TABLE g_ssn = {0};

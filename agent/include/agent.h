@@ -2,7 +2,7 @@
 #define AGENT_H
 
 #include <windows.h>
-#include <winternl.h>
+#include "ntdefs.h"
 
 // MiniDump format constants
 #define MDMP_SIGNATURE 0x504D444D

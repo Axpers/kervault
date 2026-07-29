@@ -11,7 +11,7 @@
  */
 
 #include <windows.h>
-#include <winternl.h>
+#include "../include/ntdefs.h"
 #include "../include/syscalls.h"
 #include "../include/agent.h"
 

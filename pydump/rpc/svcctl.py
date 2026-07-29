@@ -32,12 +32,14 @@ SVCCTL_VERSION = (2, 0)
 
 # Operation numbers
 OPNUM_CLOSE_SERVICE_HANDLE = 0
+OPNUM_CHANGE_SERVICE_CONFIG_W = 11
 OPNUM_DELETE_SERVICE = 2
 OPNUM_OPEN_SC_MANAGER_W = 15
 OPNUM_OPEN_SERVICE_W = 16
 OPNUM_START_SERVICE_W = 19
 OPNUM_CREATE_SERVICE_W = 12
 OPNUM_QUERY_SERVICE_STATUS_EX = 40
+OPNUM_STOP_SERVICE = 1
 
 # QueryServiceStatusEx info levels
 SC_STATUS_PROCESS_INFO = 0
@@ -48,9 +50,11 @@ SERVICE_ALL_ACCESS = 0x000F01FF
 
 # Service types
 SERVICE_WIN32_OWN_PROCESS = 0x00000010
+SERVICE_NO_CHANGE = 0xFFFFFFFF
 
 # Start types
 SERVICE_DEMAND_START = 0x00000003
+SERVICE_DISABLED = 0x00000004
 
 # Error control
 SERVICE_ERROR_IGNORE = 0x00000000
@@ -156,6 +160,40 @@ class SvcCtl:
             raise RuntimeError(f"OpenServiceW failed: 0x{status:08X}")
 
         return handle
+
+    def change_service_start_type(self, service_handle: bytes, start_type: int) -> None:
+        """RChangeServiceConfigW — change service start type."""
+        stub = ndr_handle(service_handle)
+        stub += ndr_dword(SERVICE_NO_CHANGE)   # dwServiceType (no change)
+        stub += ndr_dword(start_type)          # dwStartType
+        stub += ndr_dword(SERVICE_NO_CHANGE)   # dwErrorControl (no change)
+        stub += ndr_wstring_null()             # lpBinaryPathName (NULL = no change)
+        stub += ndr_wstring_null()             # lpLoadOrderGroup (NULL)
+        stub += ndr_dword(0)                   # lpdwTagId (NULL)
+        stub += ndr_lpbyte_null()              # lpDependencies (NULL)
+        stub += ndr_dword(0)                   # dwDependSize
+        stub += ndr_wstring_null()             # lpServiceStartName (NULL)
+        stub += ndr_lpbyte_null()              # lpPassword (NULL)
+        stub += ndr_dword(0)                   # dwPwSize
+        stub += ndr_wstring_null()             # lpDisplayName (NULL)
+
+        resp = self._call(OPNUM_CHANGE_SERVICE_CONFIG_W, stub)
+        # Response: dwTagId(4) + ReturnValue(4)
+        _, offset = parse_dword(resp, 0)
+        status, _ = parse_dword(resp, offset)
+
+        if status != 0:
+            raise RuntimeError(f"ChangeServiceConfigW failed: 0x{status:08X}")
+
+    def stop_service(self, service_handle: bytes) -> None:
+        """RControlService — send stop control to a service."""
+        stub = ndr_handle(service_handle)
+        stub += ndr_dword(1)  # SERVICE_CONTROL_STOP
+
+        resp = self._call(OPNUM_STOP_SERVICE, stub)
+        # Response: SERVICE_STATUS(28) + ReturnValue(4)
+        status, _ = parse_dword(resp, 28)
+        # Ignore errors (service might already be stopped)
 
     def query_service_pid(self, service_handle: bytes) -> int:
         """RQueryServiceStatusEx — get the PID of a service's host process."""

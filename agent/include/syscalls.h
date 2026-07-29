@@ -64,6 +64,14 @@ NTSTATUS sys_NtReadVirtualMemory(
     PSIZE_T NumberOfBytesRead
 );
 
+NTSTATUS sys_NtQueryInformationProcess(
+    HANDLE ProcessHandle,
+    DWORD ProcessInformationClass,
+    PVOID ProcessInformation,
+    ULONG ProcessInformationLength,
+    PULONG ReturnLength
+);
+
 NTSTATUS sys_NtCreateFile(
     PHANDLE FileHandle,
     ACCESS_MASK DesiredAccess,

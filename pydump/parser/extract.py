@@ -391,9 +391,17 @@ class CredentialExtractor:
                 creds = self._walk_msv_list_26k(list_head_addr)
                 if creds:
                     credentials.extend(creds)
-                    return credentials  # Found it
+                    # Don't return early — continue scanning for more lists
 
-        return credentials
+        # Deduplicate by (username, domain)
+        seen = set()
+        unique = []
+        for c in credentials:
+            key = (c.username, c.domain, c.ntlm_hash)
+            if key not in seen:
+                seen.add(key)
+                unique.append(c)
+        return unique
 
     def _walk_msv_list_26k(self, list_head: int) -> list[Credential]:
         """Walk MSV credential list for build 26000+ structure format."""

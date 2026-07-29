@@ -26,11 +26,13 @@ from smbprotocol.open import (
 class SmbSession:
     """Authenticated SMB2/3 session to a remote Windows host."""
 
-    def __init__(self, target: str, username: str, password: str, domain: str = "."):
+    def __init__(self, target: str, username: str, password: str, domain: str = ".",
+                 nt_hash: str | None = None):
         self.target = target
         self.username = username
         self.password = password
         self.domain = domain
+        self.nt_hash = nt_hash  # 32-char hex string for pass-the-hash
 
         self._conn: Connection | None = None
         self._session: Session | None = None
@@ -41,7 +43,13 @@ class SmbSession:
         self._conn = Connection(conn_id, self.target, port=445)
         self._conn.connect()
 
-        self._session = Session(self._conn, self.username, self.password)
+        if self.nt_hash:
+            # Pass-the-hash: use spnego NTLMHash credential
+            from spnego._credential import NTLMHash
+            cred = NTLMHash(self.username, nt_hash=self.nt_hash)
+            self._session = Session(self._conn, cred, "", require_encryption=False)
+        else:
+            self._session = Session(self._conn, self.username, self.password)
         self._session.connect()
 
     def disconnect(self) -> None:

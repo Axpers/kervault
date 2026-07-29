@@ -71,6 +71,11 @@ typedef struct _LDR_DATA_TABLE_ENTRY {
     ULONG      SizeOfImage;
     UNICODE_STRING FullDllName;
     UNICODE_STRING BaseDllName;
+    ULONG      Flags;
+    USHORT     LoadCount;
+    USHORT     TlsIndex;
+    LIST_ENTRY HashLinks;
+    ULONG      TimeDateStamp;
 } LDR_DATA_TABLE_ENTRY, *PLDR_DATA_TABLE_ENTRY;
 
 typedef struct _PEB {
@@ -83,6 +88,18 @@ typedef struct _PEB {
 } PEB, *PPEB;
 
 // MEMORY_BASIC_INFORMATION already defined in MinGW's winnt.h
+
+// Process information
+typedef struct _PROCESS_BASIC_INFORMATION {
+    NTSTATUS ExitStatus;
+    PPEB     PebBaseAddress;
+    ULONG_PTR AffinityMask;
+    LONG     BasePriority;
+    HANDLE   UniqueProcessId;
+    HANDLE   InheritedFromUniqueProcessId;
+} PROCESS_BASIC_INFORMATION;
+
+#define ProcessBasicInformation 0
 
 #define MEM_COMMIT  0x1000
 #define PAGE_GUARD  0x100

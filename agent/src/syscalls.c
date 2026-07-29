@@ -162,6 +162,14 @@ NTSTATUS sys_NtReadVirtualMemory(HANDLE ProcessHandle, PVOID BaseAddress,
                            NumberOfBytesToRead, NumberOfBytesRead);
 }
 
+NTSTATUS sys_NtQueryInformationProcess(HANDLE ProcessHandle, DWORD ProcessInformationClass,
+                                        PVOID ProcessInformation, ULONG ProcessInformationLength,
+                                        PULONG ReturnLength) {
+    return indirect_syscall(g_ssn.NtQueryInformationProcess, g_addr.NtQueryInformationProcess,
+                           ProcessHandle, ProcessInformationClass, ProcessInformation,
+                           ProcessInformationLength, ReturnLength);
+}
+
 NTSTATUS sys_NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
                            POBJECT_ATTRIBUTES ObjectAttributes, PIO_STATUS_BLOCK IoStatusBlock,
                            PLARGE_INTEGER AllocationSize, ULONG FileAttributes,

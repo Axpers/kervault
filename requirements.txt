@@ -1,3 +1,2 @@
 smbprotocol>=1.13.0
 pycryptodome>=3.19
-impacket>=0.11

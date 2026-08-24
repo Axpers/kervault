@@ -124,20 +124,13 @@ def _cmd_dump(args):
 
 def _process_hives(system_hive: bytes, sam_hive: bytes, security_hive: bytes):
     """Parse and decrypt registry hives received from the agent."""
-    import struct
-    from .secrets.hivereader import RegistryHive
-    from .secrets.crypto import (
-        extract_boot_key, compute_hashed_boot_key, decrypt_sam_hash_aes,
-        decrypt_lsa_key, decrypt_lsa_secret,
-    )
-    from .secrets.registry import RegistrySecrets
+    from .secrets.registry import extract_boot_key_from_hive, parse_sam_hive, parse_security_hive
 
     print()
     print("── Registry Secrets ─────────────────────────────────────────")
 
     try:
-        sys_hive = RegistryHive(system_hive)
-        boot_key = RegistrySecrets._boot_key_from_hive_static(sys_hive)
+        boot_key = extract_boot_key_from_hive(system_hive)
     except Exception as e:
         print(f"[!] Failed to parse SYSTEM hive: {e}")
         return
@@ -145,8 +138,7 @@ def _process_hives(system_hive: bytes, sam_hive: bytes, security_hive: bytes):
     # SAM hashes
     if sam_hive:
         try:
-            reg = RegistrySecrets.__new__(RegistrySecrets)
-            hashes = reg._parse_sam_hive(sam_hive, boot_key)
+            hashes = parse_sam_hive(sam_hive, boot_key)
             if hashes:
                 print(f"[+] SAM hashes ({len(hashes)}):")
                 for h in hashes:
@@ -159,8 +151,7 @@ def _process_hives(system_hive: bytes, sam_hive: bytes, security_hive: bytes):
     # LSA Secrets
     if security_hive:
         try:
-            reg = RegistrySecrets.__new__(RegistrySecrets)
-            secrets = reg._parse_security_hive(security_hive, boot_key)
+            secrets = parse_security_hive(security_hive, boot_key)
             if secrets:
                 print(f"[+] LSA Secrets ({len(secrets)}):")
                 for s in secrets:
@@ -173,8 +164,6 @@ def _process_hives(system_hive: bytes, sam_hive: bytes, security_hive: bytes):
 
 def _cmd_parse(args):
     """Parse a local dump file."""
-    from .parser.minidump import parse
-
     if not os.path.isfile(args.file):
         print(f"[!] File not found: {args.file}")
         sys.exit(1)

@@ -1,17 +1,14 @@
 """Cryptographic operations for SAM/LSA secret decryption.
 
-Implements:
-- Boot key extraction (SysKey) from SYSTEM hive
-- SAM key derivation
-- NTLM hash decryption (RC4 + DES for older, AES for newer)
-- LSA key decryption
+- Boot key extraction (SysKey permutation)
+- SAM key derivation (AES/RC4)
+- NTLM hash decryption (AES + DES RID layer)
+- LSA key decryption (SHA256 + per-block AES)
 - LSA secret decryption
-- DCC2 (cached domain credentials) decryption
 """
 
 import struct
 import hashlib
-import hmac
 
 from Crypto.Cipher import AES, DES, ARC4
 
@@ -129,35 +126,6 @@ def decrypt_lsa_secret(lsa_key: bytes, encrypted: bytes) -> bytes:
     key = sha.digest()
 
     return _lsa_aes_decrypt(key, data)
-
-
-def decrypt_cached_cred(lsa_key: bytes, nl_km: bytes, cache_entry: bytes) -> tuple[str, str, bytes]:
-    """Decrypt a cached domain credential (DCC2/mscash2).
-
-    Returns (username, domain, dcc2_hash).
-    """
-    # NL_RECORD structure
-    user_len = struct.unpack_from("<H", cache_entry, 0)[0]
-    domain_len = struct.unpack_from("<H", cache_entry, 2)[0]
-    dns_domain_len = struct.unpack_from("<H", cache_entry, 4)[0]
-
-    # Encrypted data starts at offset 96
-    iv = cache_entry[64:80]
-    enc_data = cache_entry[96:]
-
-    # Derive key from NL$KM
-    hmac_key = hmac.new(nl_km, iv, hashlib.sha1).digest()
-    cipher = ARC4.new(hmac_key)
-    decrypted = cipher.decrypt(enc_data)
-
-    # Parse decrypted data: hash(16) + username + domain...
-    cached_hash = decrypted[:16]
-    offset = 16 + (16 - 16 % 8) if 16 % 8 else 16  # align
-    offset = 72  # fixed offset for username in decrypted blob
-    username = decrypted[offset:offset + user_len].decode("utf-16-le", errors="ignore")
-    domain = cache_entry[96 + 72 + user_len:96 + 72 + user_len + domain_len].decode("utf-16-le", errors="ignore")
-
-    return username, domain, cached_hash
 
 
 def _rid_decrypt(rid: int, data: bytes) -> bytes:

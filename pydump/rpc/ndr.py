@@ -34,11 +34,6 @@ def ndr_wstring(s: str) -> bytes:
     return ref + ndr_wstring_data(s)
 
 
-def ndr_wstring_ref() -> bytes:
-    """Emit just a non-NULL referent ID (4 bytes) for deferred encoding."""
-    return struct.pack("<I", _next_referent())
-
-
 def ndr_wstring_data(s: str) -> bytes:
     """Encode the conformant+varying string body (without referent ID).
 

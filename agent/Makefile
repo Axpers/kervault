@@ -1,14 +1,8 @@
 # pydump agent — Native LSASS dumper with indirect syscalls
 #
-# Build requirements:
-#   - Visual Studio Build Tools (cl.exe, ml64.exe, link.exe)
-#   - Windows SDK
-#
 # Build:
 #   nmake          (from VS Developer Command Prompt)
-#
-# Or with MinGW cross-compilation from Linux:
-#   make cross     (requires x86_64-w64-mingw32-gcc)
+#   make cross     (from Linux with x86_64-w64-mingw32-gcc)
 
 # ─── MSVC Build ─────────────────────────────────────────────
 
@@ -20,7 +14,7 @@ CFLAGS = /nologo /O1 /GS- /W3 /I include
 ASMFLAGS = /nologo /c
 LDFLAGS = /nologo /ENTRY:main_entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB
 
-LIBS = kernel32.lib ntdll.lib advapi32.lib
+LIBS = ntdll.lib
 
 SRC = src/main.c src/syscalls.c src/dump.c src/pipe.c src/registry.c
 ASM_SRC = src/syscalls.asm
@@ -62,8 +56,8 @@ clean:
 # ─── MinGW Cross-Compilation (from Linux) ───────────────────
 
 CROSS_CC = x86_64-w64-mingw32-gcc
-CROSS_CFLAGS = -O1 -s -nostdlib -Iinclude -Wall
-CROSS_LDFLAGS = -nostartfiles -lkernel32 -lntdll -ladvapi32 -e main_entry
+CROSS_CFLAGS = -O1 -nostdlib -Iinclude -Wall
+CROSS_LDFLAGS = -nostartfiles -nodefaultlibs -e main_entry -s
 
 cross: dirs_cross
 	nasm -f win64 src/syscalls.asm -o build/syscalls_asm.o 2>/dev/null || \

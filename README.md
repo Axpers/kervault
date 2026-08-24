@@ -14,20 +14,21 @@ Zero external tool dependencies. No impacket, no nxc, no lsassy.
 
 ## How it works
 
-pydump deploys a lightweight native agent (24KB, x64) on the target as a
+pydump deploys a lightweight native agent (~12KB, x64) on the target as a
 temporary Windows service. The agent performs **all privileged operations**
 locally:
 
-1. **Registry hives**: enables `SeBackupPrivilege`, calls `RegSaveKeyW` to
-   snapshot SAM/SYSTEM/SECURITY, reads them into memory, deletes temp files
+1. **Registry hives**: enables `SeBackupPrivilege`, uses NT syscalls
+   (`NtOpenKey` / `NtSaveKey`) to snapshot SAM/SYSTEM/SECURITY into
+   temp files with `FILE_DELETE_ON_CLOSE`, reads them into memory
 2. **LSASS memory**: reads process memory using indirect syscalls, builds a
    MiniDump in-memory
-3. **Exfiltration**: streams everything back through a named pipe using a
-   binary protocol (`PYD\x01` header + hive data + MDMP)
+3. **Exfiltration**: streams everything back through a named pipe, XOR-encrypted
+   with the pipe name as a rolling key
 4. **Cleanup**: self-deletes from disk via ADS rename before exiting
 
 The Python orchestrator handles deployment (SMB upload + service creation),
-receives the pipe data, then parses and decrypts offline — no direct
+receives the encrypted pipe data, decrypts and parses offline — no direct
 registry or process access from the network.
 
 ## Architecture
@@ -38,10 +39,10 @@ ORCHESTRATOR (Linux/Python)                   TARGET (Windows)
 │  pydump CLI          │◄────────────────────►│                      │
 │                      │                      │  SVCCTL → Service    │
 │  ┌─ agent output ──┐ │   upload + execute   │  ┌─────────────────┐ │
-│  │ hives → decrypt │ │─────────────────────►│  │ agent.exe       │ │
-│  │ LSASS → parse   │ │◄─────────────────────│  │ RegSaveKey      │ │
-│  └─────────────────┘ │   named pipe stream  │  │ LSASS dump      │ │
-│                      │   (hives + MDMP)     │  │ ETW patch       │ │
+│  │ XOR decrypt     │ │─────────────────────►│  │ agent.exe       │ │
+│  │ hives → decrypt │ │◄─────────────────────│  │ NT syscalls     │ │
+│  │ LSASS → parse   │ │ XOR-encrypted stream │  │ LSASS dump      │ │
+│  └─────────────────┘ │ (hives + MDMP)       │  │ ETW patch       │ │
 │                      │                      │  │ self-delete     │ │
 └──────────────────────┘                      │  └─────────────────┘ │
                                               └──────────────────────┘
@@ -62,22 +63,24 @@ pydump/                 Python orchestrator
 │   ├── crypto.py       Boot key, SAM/LSA AES/DES/RC4 decrypt
 │   └── registry.py     SAM + LSA orchestration
 ├── dump/
-│   └── methods.py      Agent deployment + pipe read
+│   └── methods.py      Agent deployment + pipe read + XOR decrypt
 └── parser/
     ├── minidump.py     MDMP format parser
     └── extract.py      Credential extraction (MSV1.0, WDigest)
 
-agent/                  24KB x64 PE, MinGW cross-compiled
+agent/                  ~12KB x64 PE, MinGW cross-compiled
 ├── src/
 │   ├── main.c          Entry, protocol, self-delete
 │   ├── syscalls.c      Hell's Gate SSN resolution, ETW patch
-│   ├── registry.c      RegSaveKey hive extraction
+│   ├── syscalls_gas.S  Indirect syscall stubs (GAS, 4 variants by arg count)
+│   ├── syscalls.asm    Indirect syscall stubs (MASM, for MSVC builds)
+│   ├── registry.c      NT syscall hive extraction (NtOpenKey/NtSaveKey)
 │   ├── dump.c          LSASS memory read → MDMP stream
-│   └── pipe.c          Named pipe server
+│   └── pipe.c          Named pipe server, restricted DACL, XOR cipher
 └── include/
     ├── syscalls.h      DJB2 hash constants, syscall table
     ├── agent.h         MDMP structures
-    └── ntdefs.h        NT type definitions
+    └── ntdefs.h        NT type definitions, ACL/ACE structs
 ```
 
 ## Installation
@@ -122,10 +125,17 @@ At least one flag is required. Order doesn't matter.
 | Technique | Detail |
 |---|---|
 | Indirect syscalls | SSN resolved via Hell's Gate / Halo's Gate from ntdll PEB walk |
+| Stub variants | 4 asm stubs (0/2/7/10 stack shifts) matching NT arg counts — prevents stack corruption |
 | API hashing | All Nt* exports resolved by DJB2 hash — zero plaintext function names |
+| Pure NT syscalls | No Win32 API — registry, pipes, files, all via Nt* syscalls |
 | ETW patch | `EtwEventWrite` overwritten with `xor eax,eax; ret` via `NtProtectVirtualMemory` |
+| Wire encryption | Rolling XOR cipher keyed on pipe name — no plaintext signatures on the wire |
+| Restricted DACL | Pipe access limited to SYSTEM + BUILTIN\Administrators (no NULL DACL) |
 | Self-delete | ADS rename + `FileDispositionInfo` — binary removed before `ExitProcess` |
-| No CRT | `-nostdlib -nostartfiles`, 24KB binary |
+| PE hardening | `.comment` stripped, sections renamed, PE timestamp zeroed, `-fno-ident` |
+| Frame pointer omission | `-fomit-frame-pointer` — RBP-based stack walkers cannot trace frames |
+| Stealth naming | Service/pipe/agent names mimic legitimate Windows components |
+| No CRT | `-nostdlib -nostartfiles`, ~12KB binary |
 
 ## Requirements
 

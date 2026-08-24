@@ -18,28 +18,8 @@ from Crypto.Cipher import AES, DES, ARC4
 
 # Boot key class order (permutation applied to raw key)
 BOOT_KEY_PERM = [
-    0x8, 0x5, 0xE, 0x2, 0xB, 0x9, 0xD, 0x3,
-    0x0, 0x6, 0x1, 0xC, 0x4, 0xA, 0xF, 0x7,
-]
-
-# DES parity bit expansion (used for RID-based key derivation)
-PARITY_TABLE = [
-    1, 1, 2, 2, 4, 4, 7, 7, 8, 8, 11, 11, 13, 13, 14, 14,
-    16, 16, 19, 19, 21, 21, 22, 22, 25, 25, 26, 26, 28, 28, 31, 31,
-    32, 32, 35, 35, 37, 37, 38, 38, 41, 41, 42, 42, 44, 44, 47, 47,
-    49, 49, 50, 50, 52, 52, 55, 55, 56, 56, 59, 59, 61, 61, 62, 62,
-    64, 64, 67, 67, 69, 69, 70, 70, 73, 73, 74, 74, 76, 76, 79, 79,
-    81, 81, 82, 82, 84, 84, 87, 87, 88, 88, 91, 91, 93, 93, 94, 94,
-    97, 97, 98, 98, 100, 100, 103, 103, 104, 104, 107, 107, 109, 109, 110, 110,
-    112, 112, 115, 115, 117, 117, 118, 118, 121, 121, 122, 122, 124, 124, 127, 127,
-    128, 128, 131, 131, 133, 133, 134, 134, 137, 137, 138, 138, 140, 140, 143, 143,
-    145, 145, 146, 146, 148, 148, 151, 151, 152, 152, 155, 155, 157, 157, 158, 158,
-    161, 161, 162, 162, 164, 164, 167, 167, 168, 168, 171, 171, 173, 173, 174, 174,
-    176, 176, 179, 179, 181, 181, 182, 182, 185, 185, 186, 186, 188, 188, 191, 191,
-    193, 193, 194, 194, 196, 196, 199, 199, 200, 200, 203, 203, 205, 205, 206, 206,
-    208, 208, 211, 211, 213, 213, 214, 214, 217, 217, 218, 218, 220, 220, 223, 223,
-    225, 225, 226, 226, 228, 228, 231, 231, 232, 232, 235, 235, 237, 237, 238, 238,
-    241, 241, 242, 242, 244, 244, 247, 247, 248, 248, 251, 251, 253, 253, 254, 254,
+    0x8, 0x5, 0x4, 0x2, 0xB, 0x9, 0xD, 0x3,
+    0x0, 0x6, 0x1, 0xC, 0xE, 0xA, 0xF, 0x7,
 ]
 
 
@@ -84,14 +64,14 @@ def compute_hashed_boot_key(boot_key: bytes, f_value: bytes) -> bytes:
     """
     revision = struct.unpack_from("<I", f_value, 0x68)[0]
 
-    if revision == 3:
-        # AES-based (modern Windows)
+    if revision >= 2:
+        # AES-based (Windows 10+, SAM_KEY_DATA_AES: revision 2)
         salt = f_value[0x78:0x88]
         enc_key = f_value[0x88:0xA8]
         cipher = AES.new(boot_key, AES.MODE_CBC, salt)
         return cipher.decrypt(enc_key)[:16]
     else:
-        # RC4-based (legacy)
+        # RC4-based (legacy, SAM_KEY_DATA: revision 1)
         qwerty = b"!@#$%^&*()qwertyUIOPAzxcvbnmQQQQQQQQQQQQ)(*@&%\x00"
         digits = b"0123456789012345678901234567890123456789\x00"
         rc4_key = hashlib.md5(f_value[0x70:0x80] + qwerty + boot_key + digits).digest()
@@ -99,17 +79,20 @@ def compute_hashed_boot_key(boot_key: bytes, f_value: bytes) -> bytes:
         return cipher.decrypt(f_value[0x80:0xA0])
 
 
+def _lsa_aes_decrypt(key: bytes, encrypted: bytes) -> bytes:
+    """AES decrypt used by LSA — each 16-byte block decrypted independently with IV=0."""
+    result = b""
+    for i in range(0, len(encrypted), 16):
+        cipher = AES.new(key, AES.MODE_CBC, b"\x00" * 16)
+        result += cipher.decrypt(encrypted[i:i + 16])
+    return result
+
+
 def decrypt_lsa_key(boot_key: bytes, pol_ek_list: bytes) -> bytes:
     """Decrypt the LSA encryption key from SECURITY\\Policy\\PolEKList."""
-    # PolEKList structure (Vista+):
-    # version(4) + key_id(16) + enc_algo(4) + hash_algo(4) + salt(32) + ...
-    # AES-256-CBC encrypted with boot key-derived key
+    # Structure: header(28) + salt(32) + encrypted_data
     if len(pol_ek_list) < 76:
         raise RuntimeError("PolEKList too short")
-
-    version = struct.unpack_from("<I", pol_ek_list, 0)[0]
-    if version != 1:
-        raise RuntimeError(f"Unsupported PolEKList version: {version}")
 
     salt = pol_ek_list[28:60]
     encrypted = pol_ek_list[60:]
@@ -121,11 +104,10 @@ def decrypt_lsa_key(boot_key: bytes, pol_ek_list: bytes) -> bytes:
         sha.update(salt)
     key = sha.digest()
 
-    cipher = AES.new(key[:32], AES.MODE_CBC, b"\x00" * 16)
-    decrypted = cipher.decrypt(encrypted)
+    decrypted = _lsa_aes_decrypt(key, encrypted)
 
-    # The actual LSA key is at offset 68 in the decrypted blob (32 bytes)
-    return decrypted[68:100]
+    # The LSA key is at offset 0x24 in the decrypted PEKLIST_PLAIN (32 bytes)
+    return decrypted[0x24:0x44]
 
 
 def decrypt_lsa_secret(lsa_key: bytes, encrypted: bytes) -> bytes:
@@ -133,27 +115,20 @@ def decrypt_lsa_secret(lsa_key: bytes, encrypted: bytes) -> bytes:
     if len(encrypted) < 28:
         return b""
 
-    # Structure: version(4) + enc_key_id(16) + enc_algo(4) + flags(4) + enc_data
-    version = struct.unpack_from("<I", encrypted, 0)[0]
+    # Structure: header(28) + salt(32) + encrypted_data
+    salt = encrypted[28:60]
+    data = encrypted[60:]
 
-    if version == 1:
-        # Vista+ AES encryption
-        salt = encrypted[28:60]
-        data = encrypted[60:]
+    if not data:
+        return b""
 
-        sha = hashlib.sha256()
-        sha.update(lsa_key)
-        for _ in range(1000):
-            sha.update(salt)
-        key = sha.digest()
+    sha = hashlib.sha256()
+    sha.update(lsa_key)
+    for _ in range(1000):
+        sha.update(salt)
+    key = sha.digest()
 
-        cipher = AES.new(key[:32], AES.MODE_CBC, b"\x00" * 16)
-        return cipher.decrypt(data)
-    else:
-        # Pre-Vista RC4
-        key = hashlib.md5(lsa_key + encrypted[60:76]).digest()
-        cipher = ARC4.new(key)
-        return cipher.decrypt(encrypted[12:60])
+    return _lsa_aes_decrypt(key, data)
 
 
 def decrypt_cached_cred(lsa_key: bytes, nl_km: bytes, cache_entry: bytes) -> tuple[str, str, bytes]:
@@ -196,16 +171,15 @@ def _rid_decrypt(rid: int, data: bytes) -> bytes:
 
 
 def _rid_to_des_key(rid: int) -> bytes:
-    """Convert a RID to an 8-byte DES key with parity bits."""
+    """Convert a RID to an 8-byte DES key (7-bit groups shifted to positions 7-1)."""
     s = struct.pack("<I", rid) + struct.pack("<I", rid)
-    key = bytes([
-        PARITY_TABLE[s[0] >> 1],
-        PARITY_TABLE[((s[0] & 0x01) << 6) | (s[1] >> 2)],
-        PARITY_TABLE[((s[1] & 0x03) << 5) | (s[2] >> 3)],
-        PARITY_TABLE[((s[2] & 0x07) << 4) | (s[3] >> 4)],
-        PARITY_TABLE[((s[3] & 0x0F) << 3) | (s[4] >> 5)],
-        PARITY_TABLE[((s[4] & 0x1F) << 2) | (s[5] >> 6)],
-        PARITY_TABLE[((s[5] & 0x3F) << 1) | (s[6] >> 7)],
-        PARITY_TABLE[s[6] & 0x7F],
+    return bytes([
+        ((s[0] >> 1) << 1) & 0xFE,
+        ((((s[0] & 0x01) << 6) | (s[1] >> 2)) << 1) & 0xFE,
+        ((((s[1] & 0x03) << 5) | (s[2] >> 3)) << 1) & 0xFE,
+        ((((s[2] & 0x07) << 4) | (s[3] >> 4)) << 1) & 0xFE,
+        ((((s[3] & 0x0F) << 3) | (s[4] >> 5)) << 1) & 0xFE,
+        ((((s[4] & 0x1F) << 2) | (s[5] >> 6)) << 1) & 0xFE,
+        ((((s[5] & 0x3F) << 1) | (s[6] >> 7)) << 1) & 0xFE,
+        ((s[6] & 0x7F) << 1) & 0xFE,
     ])
-    return key

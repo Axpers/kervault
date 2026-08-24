@@ -209,13 +209,13 @@ class RegistryHive:
     def _read_value_name(self, offset: int) -> str:
         """Read VK cell name."""
         cell = self._read_cell(offset)
-        if len(cell) < 0x18 or cell[0:2] != b"vk":
+        if len(cell) < 0x14 or cell[0:2] != b"vk":
             return ""
         name_len = struct.unpack_from("<H", cell, 0x02)[0]
         if name_len == 0:
             return "(Default)"
         flags = struct.unpack_from("<H", cell, 0x10)[0]
-        name_bytes = cell[0x18: 0x18 + name_len]
+        name_bytes = cell[0x14: 0x14 + name_len]
         if flags & 0x0001:  # VALUE_COMP_NAME
             return name_bytes.decode("ascii", errors="replace")
         return name_bytes.decode("utf-16-le", errors="replace")
@@ -223,7 +223,7 @@ class RegistryHive:
     def _read_value_data(self, offset: int) -> tuple[int, bytes]:
         """Read VK cell data. Returns (type, data)."""
         cell = self._read_cell(offset)
-        if len(cell) < 0x18 or cell[0:2] != b"vk":
+        if len(cell) < 0x14 or cell[0:2] != b"vk":
             return 0, b""
         data_size = struct.unpack_from("<I", cell, 0x04)[0]
         data_offset = struct.unpack_from("<I", cell, 0x08)[0]

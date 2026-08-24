@@ -282,19 +282,17 @@ class RegistrySecrets:
 
     def _boot_key_from_hive(self, sys_hive) -> bytes:
         """Extract boot key from an offline SYSTEM hive file."""
-        # Find CurrentControlSet number from Select\Current
         select_key = sys_hive.open_key("Select")
         _, current_data = sys_hive.query_value(select_key, "Current")
         cs_num = struct.unpack_from("<I", current_data, 0)[0]
         cs_path = f"ControlSet{cs_num:03d}\\Control\\Lsa"
 
-        lsa_key = sys_hive.open_key(cs_path)
-
         parts = []
         for name in ("JD", "Skew1", "GBG", "Data"):
             subkey = sys_hive.open_key(f"{cs_path}\\{name}")
             class_data = sys_hive.query_key_class(subkey)
-            parts.append(class_data)
+            # Class names are UTF-16LE in hive files
+            parts.append(class_data.decode("utf-16-le").encode("ascii"))
 
         return extract_boot_key(parts[0], parts[1], parts[2], parts[3])
 
@@ -334,11 +332,17 @@ class RegistrySecrets:
 
         # Decrypt based on revision
         try:
-            if revision == 3 or (len(nt_data) > 4 and nt_data[2] == 0x02):
-                # AES (modern): skip revision(2) + offset(2), then IV(16) + encrypted
-                nt_hash = decrypt_sam_hash_aes(nt_data[4:], hashed_boot_key, rid)
+            nt_revision = struct.unpack_from("<H", nt_data, 2)[0]
+            if nt_revision >= 2:
+                # AES: PekID(2) + Revision(2) + DataOffset(4) + Salt(16) + EncHash
+                data_offset = struct.unpack_from("<I", nt_data, 4)[0]
+                if data_offset == 0 or len(nt_data) <= 24:
+                    # Empty hash (no encrypted data after salt)
+                    return SamHash(username=username, rid=rid,
+                                   ntlm_hash="31d6cfe0d16ae931b73c59d7e0c089c0")
+                nt_hash = decrypt_sam_hash_aes(nt_data[8:], hashed_boot_key, rid)
             else:
-                # RC4 (legacy): skip revision(2) + offset(2)
+                # RC4: skip 4-byte header
                 nt_hash = decrypt_sam_hash_rc4(nt_data[4:], hashed_boot_key, rid)
         except Exception:
             return SamHash(username=username, rid=rid, ntlm_hash="(decryption failed)")

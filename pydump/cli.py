@@ -83,7 +83,7 @@ def _cmd_dump(args):
                 scope.append(f"LSASS pid={lsass_pid}")
             print(f"[*] Deploying agent ({', '.join(scope)})")
 
-            result = method.execute(lsass_pid=lsass_pid)
+            result = method.execute(do_registry=do_registry, lsass_pid=lsass_pid)
 
             # SAM
             if args.sam and result.system_hive and result.sam_hive:

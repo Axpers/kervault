@@ -32,10 +32,6 @@ def main():
     parser.add_argument("--lsa", action="store_true", help="Extract LSA secrets")
     parser.add_argument("--lsass", action="store_true", help="Dump and parse LSASS memory")
 
-    # Options
-    parser.add_argument("--pid", type=int, default=None, help="LSASS PID (auto-detected)")
-    parser.add_argument("--agent", default=None, metavar="PATH", help="Path to agent.exe")
-
     args = parser.parse_args()
 
     if not args.password and not args.nt_hash:
@@ -58,7 +54,7 @@ def _cmd_dump(args):
     do_registry = args.sam or args.lsa
     do_lsass = args.lsass
 
-    agent_path = args.agent or os.path.join(os.path.dirname(os.path.dirname(__file__)), "agent", "bin", "agent.exe")
+    agent_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "agent", "bin", "agent.exe")
     if not os.path.isfile(agent_path):
         print(f"[!] Agent not found: {agent_path}")
         print("    Build it with: cd agent && make cross")
@@ -76,7 +72,7 @@ def _cmd_dump(args):
 
             lsass_pid = 0
             if do_lsass:
-                lsass_pid = args.pid or method.find_lsass_pid()
+                lsass_pid = method.find_lsass_pid()
 
             scope = []
             if do_registry:

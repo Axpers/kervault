@@ -15,6 +15,7 @@
 
 /* Pipe communication */
 HANDLE open_named_pipe(const wchar_t *pipe_name);
+void init_pipe_cipher(const wchar_t *key);
 BOOL write_pipe(HANDLE pipe, const void *data, DWORD size);
 void close_pipe(HANDLE pipe);
 

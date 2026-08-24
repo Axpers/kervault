@@ -163,6 +163,9 @@ void main_entry(void) {
         return;
     }
 
+    /* Step 3.5: Initialize XOR cipher with pipe name as key */
+    init_pipe_cipher(pipe_name);
+
     /* Step 4: Protocol header */
     BYTE magic[4] = {'P', 'Y', 'D', 0x01};
     write_pipe(pipe, magic, 4);

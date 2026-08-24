@@ -289,4 +289,32 @@ typedef struct _NT_FILE_RENAME_INFORMATION {
 
 #define MemoryBasicInformation 0
 
+/* ── ACL/ACE definitions for manual DACL construction ────── */
+
+#ifndef ACL_REVISION
+#define ACL_REVISION 2
+#endif
+
+#ifndef ACCESS_ALLOWED_ACE_TYPE
+#define ACCESS_ALLOWED_ACE_TYPE 0
+#endif
+
+#ifndef _ACE_HEADER_DEFINED
+#define _ACE_HEADER_DEFINED
+typedef struct _ACE_HEADER {
+    BYTE  AceType;
+    BYTE  AceFlags;
+    WORD  AceSize;
+} ACE_HEADER;
+#endif
+
+#ifndef _ACCESS_ALLOWED_ACE_DEFINED
+#define _ACCESS_ALLOWED_ACE_DEFINED
+typedef struct _ACCESS_ALLOWED_ACE {
+    ACE_HEADER  Header;
+    ACCESS_MASK Mask;
+    DWORD       SidStart;
+} ACCESS_ALLOWED_ACE;
+#endif
+
 #endif /* NTDEFS_H */

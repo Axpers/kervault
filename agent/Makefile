@@ -56,7 +56,8 @@ clean:
 # ─── MinGW Cross-Compilation (from Linux) ───────────────────
 
 CROSS_CC = x86_64-w64-mingw32-gcc
-CROSS_CFLAGS = -O1 -nostdlib -Iinclude -Wall
+CROSS_OBJCOPY = x86_64-w64-mingw32-objcopy
+CROSS_CFLAGS = -O1 -nostdlib -Iinclude -Wall -fno-ident -fomit-frame-pointer
 CROSS_LDFLAGS = -nostartfiles -nodefaultlibs -e main_entry -s
 
 cross: dirs_cross
@@ -68,6 +69,9 @@ cross: dirs_cross
 	$(CROSS_CC) $(CROSS_CFLAGS) -c src/pipe.c -o build/pipe.o
 	$(CROSS_CC) $(CROSS_CFLAGS) -c src/registry.c -o build/registry.o
 	$(CROSS_CC) -o bin/agent.exe build/main.o build/syscalls.o build/dump.o build/pipe.o build/registry.o build/syscalls_asm.o $(CROSS_LDFLAGS)
+	$(CROSS_OBJCOPY) --remove-section .comment bin/agent.exe 2>/dev/null || true
+	$(CROSS_OBJCOPY) --rename-section .text=.code --rename-section .rdata=.cfg bin/agent.exe 2>/dev/null || true
+	python3 -c "import struct;f=open('bin/agent.exe','r+b');f.seek(0x3c);off=struct.unpack('<I',f.read(4))[0]+8;f.seek(off);f.write(b'\0\0\0\0');f.close()"
 
 dirs_cross:
 	@mkdir -p build bin

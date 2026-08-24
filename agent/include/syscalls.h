@@ -13,6 +13,8 @@
 #define H_NtCreateFile               0x15A5ECDB
 #define H_NtWriteFile                0xD69326B2
 #define H_NtQuerySystemInformation   0xEE4F73A8
+#define H_NtProtectVirtualMemory     0x082962C8
+#define H_EtwEventWrite              0x24A8D022
 
 // Syscall numbers (resolved at runtime via Hell's Gate)
 typedef struct _SYSCALL_TABLE {
@@ -24,6 +26,7 @@ typedef struct _SYSCALL_TABLE {
     DWORD NtCreateFile;
     DWORD NtWriteFile;
     DWORD NtQuerySystemInformation;
+    DWORD NtProtectVirtualMemory;
 } SYSCALL_TABLE;
 
 // Address of `syscall` instruction in ntdll (for indirect calls)
@@ -36,6 +39,7 @@ typedef struct _SYSCALL_ADDR_TABLE {
     PVOID NtCreateFile;
     PVOID NtWriteFile;
     PVOID NtQuerySystemInformation;
+    PVOID NtProtectVirtualMemory;
 } SYSCALL_ADDR_TABLE;
 
 extern SYSCALL_TABLE g_ssn;
@@ -107,5 +111,16 @@ NTSTATUS sys_NtWriteFile(
     PLARGE_INTEGER ByteOffset,
     PULONG Key
 );
+
+NTSTATUS sys_NtProtectVirtualMemory(
+    HANDLE ProcessHandle,
+    PVOID *BaseAddress,
+    PSIZE_T RegionSize,
+    ULONG NewProtect,
+    PULONG OldProtect
+);
+
+// ETW bypass
+BOOL patch_etw(void);
 
 #endif // SYSCALLS_H

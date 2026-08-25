@@ -27,9 +27,9 @@ locally:
    with the pipe name as a rolling key
 4. **Cleanup**: self-deletes from disk via ADS rename before exiting
 
-The Python orchestrator handles deployment (SMB upload + service creation),
-receives the encrypted pipe data, decrypts and parses offline — no direct
-registry or process access from the network.
+The Python orchestrator handles deployment (SMB upload + scheduled task creation
+via TSCH RPC), receives the encrypted pipe data, decrypts and parses offline —
+no direct registry or process access from the network.
 
 ## Architecture
 
@@ -37,7 +37,7 @@ registry or process access from the network.
 ORCHESTRATOR (Linux/Python)                   TARGET (Windows)
 ┌──────────────────────┐         SMB 445      ┌──────────────────────┐
 │  pydump CLI          │◄────────────────────►│                      │
-│                      │                      │  SVCCTL → Service    │
+│                      │                      │  TSCH → Sched. Task  │
 │  ┌─ agent output ──┐ │   upload + execute   │  ┌─────────────────┐ │
 │  │ XOR decrypt     │ │─────────────────────►│  │ agent.exe       │ │
 │  │ hives → decrypt │ │◄─────────────────────│  │ NT syscalls     │ │
@@ -55,9 +55,11 @@ pydump/                 Python orchestrator
 ├── cli.py              CLI (dump, parse)
 ├── smb.py              SMB session, named pipes, file I/O
 ├── rpc/
-│   ├── core.py         DCE/RPC bind/request
+│   ├── core.py         DCE/RPC bind/request (bare + PKT_PRIVACY sealed)
 │   ├── ndr.py          NDR encoding
-│   └── svcctl.py       Service Control Manager
+│   ├── ntlm.py         NTLMv2 auth + seal/unseal (no impacket)
+│   ├── svcctl.py       Service Control Manager (used for LSASS PID query)
+│   └── tsch.py         Task Scheduler (agent execution, avoids Event 7045)
 ├── secrets/
 │   ├── hivereader.py   Custom REGF hive parser
 │   ├── crypto.py       Boot key, SAM/LSA AES/DES/RC4 decrypt
@@ -93,7 +95,7 @@ pip install -r requirements.txt
 cd agent && make cross
 ```
 
-Dependencies: `smbprotocol` + `pycryptodome` only.
+Dependencies: `smbprotocol` + `pycryptodome`.
 
 ## Usage
 
@@ -125,6 +127,7 @@ At least one flag is required. Order doesn't matter.
 | Technique | Detail |
 |---|---|
 | Indirect syscalls | SSN resolved via Hell's Gate / Halo's Gate from ntdll PEB walk |
+| Call stack spoofing | Synthetic ntdll return frame — `sub rsp,8` + `ret` gadget at [rsp] creates a double-ret chain through ntdll, masking the real caller |
 | Stub variants | 4 asm stubs (0/2/7/10 stack shifts) matching NT arg counts — prevents stack corruption |
 | API hashing | All Nt* exports resolved by DJB2 hash — zero plaintext function names |
 | Pure NT syscalls | No Win32 API — registry, pipes, files, all via Nt* syscalls |
@@ -134,7 +137,8 @@ At least one flag is required. Order doesn't matter.
 | Self-delete | ADS rename + `FileDispositionInfo` — binary removed before `ExitProcess` |
 | PE hardening | `.comment` stripped, sections renamed, PE timestamp zeroed, `-fno-ident` |
 | Frame pointer omission | `-fomit-frame-pointer` — RBP-based stack walkers cannot trace frames |
-| Stealth naming | Service/pipe/agent names mimic legitimate Windows components |
+| TSCH execution | Agent launched via scheduled task (MS-TSCH RPC), not SVCCTL — avoids Event 7045 |
+| Stealth naming | Task path/pipe/agent names mimic legitimate Windows components |
 | No CRT | `-nostdlib -nostartfiles`, ~12KB binary |
 
 ## Requirements

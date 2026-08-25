@@ -83,6 +83,7 @@ typedef struct _SYSCALL_ADDR_TABLE {
 
 extern SYSCALL_TABLE g_ssn;
 extern SYSCALL_ADDR_TABLE g_addr;
+extern PVOID g_ret_gadget;
 
 BOOL resolve_syscalls(void);
 

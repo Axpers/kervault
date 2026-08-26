@@ -52,6 +52,28 @@ TASK_XML = (
     "</Exec></Actions></Task>"
 )
 
+TASK_XML_DELAYED = (
+    '<?xml version="1.0" encoding="UTF-16"?>'
+    '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+    "<Triggers><RegistrationTrigger>"
+    "<Delay>PT{delay}S</Delay>"
+    "<Enabled>true</Enabled>"
+    "</RegistrationTrigger></Triggers>"
+    '<Principals><Principal id="S">'
+    "<UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel>"
+    "</Principal></Principals>"
+    "<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"
+    "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"
+    "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"
+    "<AllowHardTerminate>true</AllowHardTerminate>"
+    "<AllowStartOnDemand>false</AllowStartOnDemand>"
+    "<Enabled>true</Enabled><Hidden>true</Hidden>"
+    "<ExecutionTimeLimit>PT1H</ExecutionTimeLimit></Settings>"
+    '<Actions Context="S"><Exec>'
+    "<Command>{cmd}</Command><Arguments>{args}</Arguments>"
+    "</Exec></Actions></Task>"
+)
+
 
 class TaskScheduler:
     """MS-TSCH RPC client using NTLM-sealed DCE/RPC over a named pipe."""
@@ -78,8 +100,13 @@ class TaskScheduler:
 
         self._seal = SealContext(session_key)
 
+    @staticmethod
+    def _xml_esc(s: str) -> str:
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
     def register_task(self, path: str, command: str, arguments: str) -> None:
-        xml = TASK_XML.format(cmd=command, args=arguments)
+        xml = TASK_XML.format(cmd=self._xml_esc(command),
+                              args=self._xml_esc(arguments))
         stub = (
             ndr_wstring(path)           # [unique] path
             + ndr_wstring_data(xml)     # [ref] xml
@@ -88,6 +115,22 @@ class TaskScheduler:
             + ndr_dword(TASK_LOGON_NONE)
             + ndr_dword(0)              # cCreds
             + ndr_dword(0)              # pCreds = NULL
+        )
+        self._call(1, stub)
+
+    def register_task_delayed(self, path: str, command: str,
+                              arguments: str, delay: int = 5) -> None:
+        xml = TASK_XML_DELAYED.format(cmd=self._xml_esc(command),
+                                      args=self._xml_esc(arguments),
+                                      delay=delay)
+        stub = (
+            ndr_wstring(path)
+            + ndr_wstring_data(xml)
+            + ndr_dword(TASK_CREATE)
+            + ndr_wstring_null()
+            + ndr_dword(TASK_LOGON_NONE)
+            + ndr_dword(0)
+            + ndr_dword(0)
         )
         self._call(1, stub)
 

@@ -39,6 +39,7 @@ OPNUM_START_SERVICE_W = 19
 OPNUM_CREATE_SERVICE_W = 12
 OPNUM_QUERY_SERVICE_STATUS_EX = 40
 OPNUM_STOP_SERVICE = 1
+OPNUM_CHANGE_SERVICE_CONFIG2_W = 37
 
 # QueryServiceStatusEx info levels
 SC_STATUS_PROCESS_INFO = 0
@@ -247,6 +248,55 @@ class SvcCtl:
 
         if status != 0:
             raise RuntimeError(f"DeleteService failed: 0x{status:08X}")
+
+    def set_failure_actions(self, service_handle: bytes,
+                           command: str) -> None:
+        """RChangeServiceConfig2W — set SC_ACTION_RUN_COMMAND on failure."""
+        cmd_utf16 = (command + "\x00").encode("utf-16-le")
+        cmd_chars = len(command) + 1
+        cmd_pad = b"\x00" * ((4 - len(cmd_utf16) % 4) % 4)
+
+        stub = ndr_handle(service_handle)
+        stub += ndr_dword(2)                        # dwInfoLevel
+        stub += ndr_dword(2)                        # union discriminant
+        stub += struct.pack("<I", 0x00020100)       # ptr SERVICE_FAILURE_ACTIONSW
+
+        stub += ndr_dword(0)                        # dwResetPeriod
+        stub += ndr_wstring_null()                  # lpRebootMsg = NULL
+        stub += struct.pack("<I", 0x00020104)       # ptr lpCommand
+        stub += ndr_dword(1)                        # cActions
+        stub += struct.pack("<I", 0x00020108)       # ptr lpsaActions
+
+        stub += struct.pack("<III", cmd_chars, 0, cmd_chars)
+        stub += cmd_utf16 + cmd_pad
+
+        stub += ndr_dword(1)                        # array max_count
+        stub += struct.pack("<II", 3, 0)            # RUN_COMMAND, Delay=0
+
+        resp = self._call(OPNUM_CHANGE_SERVICE_CONFIG2_W, stub)
+        status, _ = parse_dword(resp, 0)
+        if status != 0:
+            raise RuntimeError(
+                f"ChangeServiceConfig2W failed: 0x{status:08X}")
+
+    def set_failure_actions_flag(self, service_handle: bytes,
+                                 enabled: bool = True) -> None:
+        """Set FailureActionsOnNonCrashFailures flag.
+
+        When enabled, failure actions fire even if the service exits
+        during START_PENDING without reaching SERVICE_RUNNING.
+        """
+        stub = ndr_handle(service_handle)
+        stub += ndr_dword(4)                        # dwInfoLevel
+        stub += ndr_dword(4)                        # union discriminant
+        stub += struct.pack("<I", 0x00020200)       # ptr SERVICE_FAILURE_ACTIONS_FLAG
+        stub += ndr_dword(1 if enabled else 0)      # fFailureActionsOnNonCrashFailures
+
+        resp = self._call(OPNUM_CHANGE_SERVICE_CONFIG2_W, stub)
+        status, _ = parse_dword(resp, 0)
+        if status != 0:
+            raise RuntimeError(
+                f"ChangeServiceConfig2W (flag) failed: 0x{status:08X}")
 
     def close_handle(self, handle: bytes) -> None:
         """RCloseServiceHandle — close a service/SCM handle."""

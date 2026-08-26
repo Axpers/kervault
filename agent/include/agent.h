@@ -21,5 +21,6 @@ void close_pipe(HANDLE pipe);
 
 /* LSASS dump */
 BOOL dump_lsass(DWORD pid, HANDLE pipe);
+BOOL spawn_lsass_child(DWORD pid, HANDLE pipe, const wchar_t *output_name);
 
 #endif /* AGENT_H */

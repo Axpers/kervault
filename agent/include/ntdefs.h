@@ -244,6 +244,38 @@ typedef struct _NT_PROCESS_BASIC_INFORMATION {
 #define SE_BACKUP_PRIVILEGE_LUID_LOW  17
 #define SE_BACKUP_PRIVILEGE_LUID_HIGH 0
 
+/* SeDebugPrivilege LUID = {20, 0} */
+#define SE_DEBUG_PRIVILEGE_LUID_LOW   20
+#define SE_DEBUG_PRIVILEGE_LUID_HIGH  0
+
+#ifndef TOKEN_DUPLICATE
+#define TOKEN_DUPLICATE 0x0002
+#endif
+#ifndef TOKEN_IMPERSONATE
+#define TOKEN_IMPERSONATE 0x0004
+#endif
+
+typedef enum _TOKEN_TYPE {
+    TokenPrimary = 1,
+    TokenImpersonation
+} TOKEN_TYPE;
+
+#define ThreadImpersonationToken 5
+
+typedef enum _SECURITY_IMPERSONATION_LEVEL {
+    SecurityAnonymous,
+    SecurityIdentification,
+    SecurityImpersonation,
+    SecurityDelegation
+} SECURITY_IMPERSONATION_LEVEL;
+
+typedef struct _SECURITY_QUALITY_OF_SERVICE {
+    DWORD Length;
+    SECURITY_IMPERSONATION_LEVEL ImpersonationLevel;
+    BYTE ContextTrackingMode;
+    BOOLEAN EffectiveOnly;
+} SECURITY_QUALITY_OF_SERVICE;
+
 /* ── Security descriptor helpers (use MinGW's SD struct) ─── */
 
 #ifndef SE_DACL_PRESENT
@@ -316,5 +348,38 @@ typedef struct _ACCESS_ALLOWED_ACE {
     DWORD       SidStart;
 } ACCESS_ALLOWED_ACE;
 #endif
+
+/* ── NtCreateUserProcess structures ──────────────────────── */
+
+typedef struct _PS_ATTRIBUTE {
+    ULONG_PTR Attribute;
+    SIZE_T    Size;
+    union {
+        ULONG_PTR Value;
+        PVOID     ValuePtr;
+    };
+    PSIZE_T   ReturnLength;
+} PS_ATTRIBUTE;
+
+typedef struct _PS_ATTRIBUTE_LIST {
+    SIZE_T       TotalLength;
+    PS_ATTRIBUTE Attributes[3];
+} PS_ATTRIBUTE_LIST;
+
+typedef struct _PS_CREATE_INFO {
+    SIZE_T Size;
+    ULONG  State;
+    union {
+        struct { ULONG64 InitFlags; ACCESS_MASK AdditionalFileAccess; } InitState;
+        BYTE   _pad[72];
+    };
+} PS_CREATE_INFO;
+
+#define PS_ATTRIBUTE_IMAGE_NAME     0x00020005
+#define PS_ATTRIBUTE_PARENT_PROCESS 0x00060000
+
+#define RTL_USER_PROC_PARAMS_NORMALIZED 0x01
+
+#define ProcessImageFileName 27
 
 #endif /* NTDEFS_H */

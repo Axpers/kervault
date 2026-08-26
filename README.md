@@ -6,7 +6,7 @@ Zero external tool dependencies. No impacket, no nxc, no lsassy.
 
 ## Features
 
-- **SAM hashes** — RegSaveKey + offline REGF parse + AES/DES decrypt (verified against nxc)
+- **SAM hashes** — raw NTFS disk read of hive files + AES/DES decrypt (verified against nxc)
 - **LSA secrets** — DPAPI keys, service passwords, NL$KM
 - **LSASS dump** — native C agent, indirect syscalls, dump streamed via named pipe
 - **LSASS parser** — custom MDMP parser, NTLM + WDigest extraction (Win11 24H2)
@@ -18,9 +18,9 @@ pydump deploys a lightweight native agent (~12KB, x64) on the target as a
 temporary Windows service. The agent performs **all privileged operations**
 locally:
 
-1. **Registry hives**: enables `SeBackupPrivilege`, uses NT syscalls
-   (`NtOpenKey` / `NtSaveKey`) to snapshot SAM/SYSTEM/SECURITY into
-   temp files with `FILE_DELETE_ON_CLOSE`, reads them into memory
+1. **Registry hives**: opens the raw C: volume and parses NTFS structures
+   (boot sector, MFT, directory indexes, data runs) to read SAM/SYSTEM/SECURITY
+   hive files directly from disk clusters — bypasses kernel file locks and EDR file filters
 2. **LSASS memory**: reads process memory using indirect syscalls, builds a
    MiniDump in-memory
 3. **Exfiltration**: streams everything back through a named pipe, XOR-encrypted
@@ -59,7 +59,8 @@ pydump/                 Python orchestrator
 │   ├── ndr.py          NDR encoding
 │   ├── ntlm.py         NTLMv2 auth + seal/unseal (no impacket)
 │   ├── svcctl.py       Service Control Manager (used for LSASS PID query)
-│   └── tsch.py         Task Scheduler (agent execution, avoids Event 7045)
+│   ├── tsch.py         Task Scheduler (agent execution, avoids Event 7045)
+│   └── winreg.py       Windows Remote Registry RPC
 ├── secrets/
 │   ├── hivereader.py   Custom REGF hive parser
 │   ├── crypto.py       Boot key, SAM/LSA AES/DES/RC4 decrypt
@@ -76,11 +77,13 @@ agent/                  ~12KB x64 PE, MinGW cross-compiled
 │   ├── syscalls.c      Hell's Gate SSN resolution, ETW patch
 │   ├── syscalls_gas.S  Indirect syscall stubs (GAS, 4 variants by arg count)
 │   ├── syscalls.asm    Indirect syscall stubs (MASM, for MSVC builds)
-│   ├── registry.c      NT syscall hive extraction (NtOpenKey/NtSaveKey)
+│   ├── registry.c      Hive file reading — raw NTFS volume access
+│   ├── ntfs.c          NTFS parser — boot sector, MFT, indexes, data runs
 │   ├── dump.c          LSASS memory read → MDMP stream
 │   └── pipe.c          Named pipe server, restricted DACL, XOR cipher
 └── include/
     ├── syscalls.h      DJB2 hash constants, syscall table
+    ├── ntfs.h          Raw NTFS reader API
     ├── agent.h         MDMP structures
     └── ntdefs.h        NT type definitions, ACL/ACE structs
 ```
@@ -130,6 +133,7 @@ At least one flag is required. Order doesn't matter.
 | Call stack spoofing | Synthetic ntdll return frame — `sub rsp,8` + `ret` gadget at [rsp] creates a double-ret chain through ntdll, masking the real caller |
 | Stub variants | 4 asm stubs (0/2/7/10 stack shifts) matching NT arg counts — prevents stack corruption |
 | API hashing | All Nt* exports resolved by DJB2 hash — zero plaintext function names |
+| Raw NTFS reads | Hive files read from raw disk clusters — bypasses kernel file locks, DACLs, and EDR file filters |
 | Pure NT syscalls | No Win32 API — registry, pipes, files, all via Nt* syscalls |
 | ETW patch | `EtwEventWrite` overwritten with `xor eax,eax; ret` via `NtProtectVirtualMemory` |
 | Wire encryption | Rolling XOR cipher keyed on pipe name — no plaintext signatures on the wire |

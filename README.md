@@ -139,6 +139,7 @@ agent/                  ~44KB x64 PE, MinGW cross-compiled
 
 ## Installation
 
+Python dependencies
 ```bash
 virtualenv env && source env/bin/activate && pip install -r requirements.txt
 ```

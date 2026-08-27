@@ -19,6 +19,14 @@ WINREG_UUID = (
 WINREG_VERSION = (1, 0)
 
 KEY_READ = 0x20019
+KEY_ALL_ACCESS = 0xF003F
+KEY_WRITE = 0x20006
+
+REG_SZ = 1
+REG_EXPAND_SZ = 2
+REG_BINARY = 3
+REG_DWORD = 4
+REG_MULTI_SZ = 7
 
 _ref = 0x00060000
 
@@ -186,6 +194,72 @@ class WinReg:
             raise RuntimeError(f"EnumKey: 0x{status:08X}")
 
         return raw.decode("utf-16-le", errors="ignore").rstrip("\x00")
+
+    def open_key_write(self, parent: bytes, subkey: str) -> bytes:
+        """BaseRegOpenKey (opnum 15) — open a subkey with write access."""
+        stub = ndr_handle(parent)
+        stub += _rrp_string(subkey)
+        stub += ndr_dword(0)
+        stub += ndr_dword(KEY_ALL_ACCESS)
+        resp = self._call(15, stub)
+        handle, off = parse_context_handle(resp, 0)
+        status, _ = parse_dword(resp, off)
+        if status != 0:
+            raise RuntimeError(f"OpenKey(write) '{subkey}': 0x{status:08X}")
+        return handle
+
+    def create_key(self, parent: bytes, subkey: str) -> bytes:
+        """BaseRegCreateKey (opnum 6) — create or open a subkey."""
+        stub = ndr_handle(parent)
+        stub += _rrp_string(subkey)
+        stub += _rrp_string("")                       # lpClass
+        stub += ndr_dword(0)                          # dwOptions
+        stub += ndr_dword(KEY_ALL_ACCESS)             # samDesired
+        stub += struct.pack("<I", 0)                  # lpSecurityAttributes = NULL
+        stub += struct.pack("<II", _ref_id(), 0)      # lpdwDisposition: ptr to DWORD=0
+        resp = self._call(6, stub)
+        handle, off = parse_context_handle(resp, 0)
+        _ref, off = parse_dword(resp, off)            # disposition pointer
+        if _ref:
+            _disp, off = parse_dword(resp, off)
+        status, _ = parse_dword(resp, off)
+        if status != 0:
+            raise RuntimeError(f"CreateKey '{subkey}': 0x{status:08X}")
+        return handle
+
+    def set_value(self, key: bytes, name: str, reg_type: int,
+                  data: bytes) -> None:
+        """BaseRegSetValue (opnum 22) — write a registry value."""
+        stub = ndr_handle(key)
+        stub += _rrp_string(name)
+        stub += ndr_dword(reg_type)
+        stub += struct.pack("<I", len(data))
+        stub += data
+        if len(data) % 4:
+            stub += b"\x00" * (4 - len(data) % 4)
+        stub += ndr_dword(len(data))
+        resp = self._call(22, stub)
+        status, _ = parse_dword(resp, 0)
+        if status != 0:
+            raise RuntimeError(f"SetValue '{name}': 0x{status:08X}")
+
+    def delete_value(self, key: bytes, name: str) -> None:
+        """BaseRegDeleteValue (opnum 8)."""
+        stub = ndr_handle(key)
+        stub += _rrp_string(name)
+        resp = self._call(8, stub)
+        status, _ = parse_dword(resp, 0)
+        if status != 0:
+            raise RuntimeError(f"DeleteValue '{name}': 0x{status:08X}")
+
+    def delete_key(self, parent: bytes, subkey: str) -> None:
+        """BaseRegDeleteKey (opnum 7)."""
+        stub = ndr_handle(parent)
+        stub += _rrp_string(subkey)
+        resp = self._call(7, stub)
+        status, _ = parse_dword(resp, 0)
+        if status != 0:
+            raise RuntimeError(f"DeleteKey '{subkey}': 0x{status:08X}")
 
     def close_key(self, key: bytes) -> None:
         """BaseRegCloseKey (opnum 5)."""

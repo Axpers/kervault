@@ -8,7 +8,7 @@ Zero external tool dependencies. No impacket, no nxc, no lsassy.
 
 - **SAM hashes** — raw NTFS disk read of hive files + AES/DES decrypt (verified against nxc)
 - **LSA secrets** — DPAPI keys, service passwords, NL$KM
-- **LSASS dump** — pointer-following memory read via indirect syscalls, EDR-evasive SCM failure action delivery
+- **LSASS dump** — BYOVD kernel driver reads LSASS via MmCopyVirtualMemory, zero NtReadVirtualMemory, zero EDR alerts
 - **LSASS parser** — custom MDMP parser, MSV1.0 (NTLM) + WDigest extraction
 - **Disk module injection** — lsasrv.dll .text loaded from disk via SMB for pattern scanning (no LSASS .text read)
 - **Pass-the-Hash** — `-H` flag, no password needed
@@ -27,27 +27,31 @@ executed via Task Scheduler (MS-TSCH RPC, avoids Event 7045).
 
 ### LSASS memory (--lsass)
 
-Two-stage SCM failure action mechanism:
+BYOVD (Bring Your Own Vulnerable Driver) approach with three layers of evasion:
+
+1. **Driver load** — uploads a signed kernel driver (KKYUM.sys) via SMB to
+   `System32\drivers\`, creates and starts a kernel driver service via SVCCTL
+2. **ETW-Ti disable** — agent reads ntoskrnl.exe on disk to find
+   `EtwThreatIntProvRegHandle` RVA, zeros it via the driver's kernel write
+   primitive — kills the telemetry pipeline
+3. **Direct process read** — agent reads LSASS memory via the driver's
+   `MmCopyVirtualMemory` IOCTL (kernel-mode cross-process copy), completely
+   bypassing `NtReadVirtualMemory` and the user-mode syscall layer
+
+The process handle is opened with `PROCESS_QUERY_INFORMATION` only (no
+`PROCESS_VM_READ`), so EDR OB callbacks have nothing to strip or alert on.
+Memory reads go through the kernel driver, invisible to user-mode hooks.
+
+Agent delivery uses a two-stage SCM failure action:
 
 1. **Service stub** — agent registers as a Windows service (mode 16), reaches
-   `SERVICE_RUNNING` via proper service protocol, then exits with error code 1
-2. **Failure action** — SCM detects the "crash" and spawns the real dump command
-   as a LOCAL process (created by `services.exe`), not a remote RPC child
+   `SERVICE_RUNNING`, then exits with error code 1
+2. **Failure action** — SCM spawns the real dump command as a LOCAL process
+   (created by `services.exe`)
 
-The dump itself uses a **pointer-following** approach instead of a full
-MiniDumpWriteDump:
-
-1. Reads only lsasrv's `.data` section (~40KB) from LSASS memory
-2. Follows key handle pointers to read AES/3DES BCrypt key structures (~512B each)
-3. Walks the LogonSession hash table (32 buckets, Flink chains) to read session
-   entries, usernames, domains, and encrypted credential blobs
-4. Total LSASS reads: **~700KB in ~180 NtReadVirtualMemory calls** — stays well
-   under EDR byte/call thresholds that trigger `minidumpwritedump_rpm_terminate.2`
-
-The Python orchestrator then injects lsasrv.dll's `.text` section from disk
-(read via SMB) as a synthetic memory segment — provides pattern signatures for
-the credential extractor without ever touching LSASS `.text` in memory. On x64,
-`.text` is identical on disk and in memory (RIP-relative addressing, no fixups).
+The Python orchestrator injects lsasrv.dll's `.text` section from disk (read
+via SMB) as a synthetic memory segment — provides pattern signatures for the
+credential extractor without ever touching LSASS `.text` in memory.
 
 ### Exfiltration
 
@@ -71,7 +75,13 @@ ORCHESTRATOR (Linux/Python)                   TARGET (Windows)
 │  ┌─ disk inject ───┐ │  SVCCTL → failure    │  ┌────────▼────────┐ │
 │  │ lsasrv.dll .text│ │  action (LSASS)      │  │ services.exe    │ │
 │  │ via SMB read    │ │                      │  │ → agent.exe     │ │
-│  └─────────────────┘ │◄─────────────────────│  │ (LOCAL process) │ │
+│  └─────────────────┘ │  SVCCTL → kernel     │  │ (LOCAL process) │ │
+│                      │  driver service      │  └────────┬────────┘ │
+│                      │                      │           │          │
+│                      │                      │  ┌────────▼────────┐ │
+│                      │                      │  │ KKYUM.sys       │ │
+│                      │                      │  │ MmCopyVirtMem   │ │
+│                      │◄─────────────────────│  │ → LSASS read    │ │
 │                      │ XOR-encrypted output │  └─────────────────┘ │
 └──────────────────────┘                      └──────────────────────┘
 ```
@@ -94,26 +104,30 @@ pydump/                 Python orchestrator
 │   ├── crypto.py       Boot key, SAM/LSA AES/DES/RC4 decrypt
 │   └── registry.py     SAM + LSA orchestration
 ├── dump/
-│   └── methods.py      Agent deployment, SCM failure action, XOR decrypt
+│   └── methods.py      Agent deployment, BYOVD driver load, XOR decrypt
 └── parser/
     ├── minidump.py     MDMP format parser
     └── extract.py      Credential extraction (MSV1.0, WDigest)
 
 agent/                  ~12KB x64 PE, MinGW cross-compiled
 ├── src/
-│   ├── main.c          Entry, service stub (mode 16), self-delete
+│   ├── main.c          Entry, service stub (mode 16), BYOVD orchestration, self-delete
+│   ├── byovd.c         BYOVD driver interface — ETW-Ti disable, kernel R/W, direct process read
 │   ├── syscalls.c      Hell's Gate SSN resolution, ETW patch
 │   ├── syscalls_gas.S  Indirect syscall stubs (GAS, 4 variants by arg count)
 │   ├── syscalls.asm    Indirect syscall stubs (MASM, for MSVC builds)
 │   ├── registry.c      Hive file reading — raw NTFS volume access
 │   ├── ntfs.c          NTFS parser — boot sector, MFT, indexes, data runs
-│   ├── dump.c          Pointer-following LSASS dump → MDMP stream
+│   ├── dump.c          LSASS dump → MDMP stream (KKYUM or NtReadVirtualMemory)
 │   └── pipe.c          Named pipe server, restricted DACL, XOR cipher
-└── include/
-    ├── syscalls.h      DJB2 hash constants, syscall table
-    ├── ntfs.h          Raw NTFS reader API
-    ├── agent.h         MDMP structures
-    └── ntdefs.h        NT type definitions, ACL/ACE structs
+├── include/
+│   ├── byovd.h         BYOVD types and API
+│   ├── syscalls.h      DJB2 hash constants, syscall table
+│   ├── ntfs.h          Raw NTFS reader API
+│   ├── agent.h         MDMP structures
+│   └── ntdefs.h        NT type definitions, ACL/ACE structs
+└── drivers/
+    └── KKYUM.sys        Signed kernel driver (MmCopyVirtualMemory)
 ```
 
 ## Installation
@@ -161,7 +175,10 @@ At least one flag is required. Order doesn't matter.
 | Call stack spoofing | Synthetic ntdll return frame — `sub rsp,8` + `ret` gadget at [rsp] creates a double-ret chain through ntdll, masking the real caller |
 | Stub variants | 4 asm stubs (0/2/7/10 stack shifts) matching NT arg counts — prevents stack corruption |
 | API hashing | All Nt* exports resolved by DJB2 hash — zero plaintext function names |
-| Pointer-following dump | Reads only lsasrv .data + specific heap addresses — ~700KB / ~180 calls vs ~50MB for full MiniDumpWriteDump |
+| BYOVD kernel driver | KKYUM.sys loaded as kernel service — MmCopyVirtualMemory for arbitrary cross-process reads |
+| ETW-Ti disable | EtwThreatIntProvRegHandle zeroed via kernel write — kills telemetry pipeline |
+| Direct process read | LSASS memory read via kernel IOCTL, no NtReadVirtualMemory, no user-mode hooks |
+| OB callback bypass | Handle opened with PROCESS_QUERY_INFORMATION only — OB callbacks have nothing to strip |
 | Disk module injection | lsasrv.dll .text from disk provides pattern signatures — no LSASS .text memory read needed |
 | SCM failure action | Service stub exits with error → SCM spawns dump agent as LOCAL process (created by services.exe) |
 | NtGetNextProcess | Handle acquisition without CLIENT_ID — no NtOpenProcess on LSASS |

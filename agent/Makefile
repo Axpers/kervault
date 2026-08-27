@@ -1,4 +1,4 @@
-# pydump agent — Native LSASS dumper with indirect syscalls
+# kervault agent — Native LSASS dumper with indirect syscalls
 #
 # Build:
 #   nmake          (from VS Developer Command Prompt)
@@ -16,9 +16,9 @@ LDFLAGS = /nologo /ENTRY:main_entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB
 
 LIBS = ntdll.lib
 
-SRC = src/main.c src/syscalls.c src/dump.c src/pipe.c src/registry.c src/ntfs.c
+SRC = src/main.c src/syscalls.c src/dump.c src/pipe.c src/registry.c src/ntfs.c src/byovd.c
 ASM_SRC = src/syscalls.asm
-OBJS = build/main.obj build/syscalls.obj build/dump.obj build/pipe.obj build/registry.obj build/ntfs.obj build/syscalls_asm.obj
+OBJS = build/main.obj build/syscalls.obj build/dump.obj build/pipe.obj build/registry.obj build/ntfs.obj build/byovd.obj build/syscalls_asm.obj
 
 OUT = bin/agent.exe
 
@@ -44,6 +44,9 @@ build/registry.obj: src/registry.c
 	$(CC) $(CFLAGS) /c /Fo$@ $**
 
 build/ntfs.obj: src/ntfs.c
+	$(CC) $(CFLAGS) /c /Fo$@ $**
+
+build/byovd.obj: src/byovd.c
 	$(CC) $(CFLAGS) /c /Fo$@ $**
 
 build/syscalls_asm.obj: src/syscalls.asm

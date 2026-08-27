@@ -1,3 +1,3 @@
 #\!/usr/bin/env python3
-from pydump.cli import main
+from kervault.cli import main
 main()

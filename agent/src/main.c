@@ -1,5 +1,5 @@
 /**
- * pydump agent — entry point. Zero kernel32/advapi32 dependencies.
+ * kervault agent — entry point. Zero kernel32/advapi32 dependencies.
  * Command line: agent.exe <MODE> <PID> <OUTPUT_NAME>
  *   mode & 4 = hive file reads (NtCreateFile + NtReadFile)
  *   mode & 2 = LSASS minidump

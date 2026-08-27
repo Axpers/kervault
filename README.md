@@ -1,4 +1,4 @@
-# pydump
+# kervault
 
 Remote Windows credential extraction over SMB — SAM/LSA secrets + LSASS memory dump.
 
@@ -8,14 +8,14 @@ Zero external tool dependencies. No impacket, no nxc, no lsassy.
 
 - **SAM hashes** — raw NTFS disk read of hive files + AES/DES decrypt (verified against nxc)
 - **LSA secrets** — DPAPI keys, service passwords, NL$KM
-- **LSASS dump** — BYOVD kernel driver reads LSASS via MmCopyVirtualMemory, zero NtReadVirtualMemory, zero EDR alerts
+- **LSASS dump** — BYOVD kernel driver reads LSASS via MmCopyVirtualMemory, zero `NtReadVirtualMemory`, zero EDR alerts
 - **LSASS parser** — custom MDMP parser, MSV1.0 (NTLM) + WDigest extraction
 - **Disk module injection** — lsasrv.dll .text loaded from disk via SMB for pattern scanning (no LSASS .text read)
 - **Pass-the-Hash** — `-H` flag, no password needed
 
 ## How it works
 
-pydump deploys a lightweight native agent (~12KB, x64) on the target. The agent
+kervault deploys a lightweight native agent (~44KB, x64) on the target. The agent
 performs **all privileged operations** locally using only NT syscalls:
 
 ### Registry hives (--sam, --lsa)
@@ -64,7 +64,7 @@ before exiting.
 ```
 ORCHESTRATOR (Linux/Python)                   TARGET (Windows)
 ┌──────────────────────┐         SMB 445      ┌──────────────────────┐
-│  pydump CLI          │◄────────────────────►│                      │
+│  kervault CLI        │◄────────────────────►│                      │
 │                      │                      │                      │
 │  ┌─ agent output ──┐ │   upload agent.exe   │  ┌─────────────────┐ │
 │  │ XOR decrypt     │ │─────────────────────►│  │ agent.exe       │ │
@@ -89,7 +89,10 @@ ORCHESTRATOR (Linux/Python)                   TARGET (Windows)
 ### Project structure
 
 ```
-pydump/                 Python orchestrator
+main.py                 Entry point
+requirements.txt        Dependencies (smbprotocol, pycryptodome)
+
+kervault/               Python orchestrator
 ├── cli.py              CLI + disk module injection (lsasrv.dll via SMB)
 ├── smb.py              SMB session, named pipes, file I/O
 ├── rpc/
@@ -109,7 +112,8 @@ pydump/                 Python orchestrator
     ├── minidump.py     MDMP format parser
     └── extract.py      Credential extraction (MSV1.0, WDigest)
 
-agent/                  ~12KB x64 PE, MinGW cross-compiled
+agent/                  ~44KB x64 PE, MinGW cross-compiled
+├── Makefile            MSVC (nmake) + MinGW cross-compilation (make cross)
 ├── src/
 │   ├── main.c          Entry, service stub (mode 16), BYOVD orchestration, self-delete
 │   ├── byovd.c         BYOVD driver interface — ETW-Ti disable, kernel R/W, direct process read
@@ -122,19 +126,22 @@ agent/                  ~12KB x64 PE, MinGW cross-compiled
 │   └── pipe.c          Named pipe server, restricted DACL, XOR cipher
 ├── include/
 │   ├── byovd.h         BYOVD types and API
+│   ├── registry.h      Hive reader API
 │   ├── syscalls.h      DJB2 hash constants, syscall table
 │   ├── ntfs.h          Raw NTFS reader API
 │   ├── agent.h         MDMP structures
 │   └── ntdefs.h        NT type definitions, ACL/ACE structs
 └── drivers/
-    └── KKYUM.sys        Signed kernel driver (MmCopyVirtualMemory)
+    ├── KKYUM.sys        Signed kernel driver — MmCopyVirtualMemory (primary)
+    ├── signeddrv.sys    Fallback driver — .data section R/W only
+    └── RTCore64.sys     Fallback driver — MSI Afterburner
 ```
 
 ## Installation
 
 ```bash
-virtualenv env && source env/bin/activate
-pip install -r requirements.txt
+virtualenv env && source env/bin/activate && pip install -r requirements.txt
+```
 
 # Build agent (requires x86_64-w64-mingw32-gcc)
 cd agent && make cross
@@ -156,16 +163,13 @@ Three flags, combine as needed:
 python main.py -t 10.0.0.5 -u admin -p pass --sam
 python main.py -t 10.0.0.5 -u admin -p pass --lsa
 python main.py -t 10.0.0.5 -u admin -p pass --lsass
-python main.py -t 10.0.0.5 -u admin -p pass --sam --lsa
-python main.py -t 10.0.0.5 -u admin -p pass --sam --lsass
-python main.py -t 10.0.0.5 -u admin -p pass --lsa --lsass
 python main.py -t 10.0.0.5 -u admin -p pass --sam --lsa --lsass
 
 # Pass-the-Hash
 python main.py -t 10.0.0.5 -u admin -H aad3b4...ef40 --sam --lsa
 ```
 
-At least one flag is required. Order doesn't matter.
+At least one flag is required. All of them can be combined, order doesn't matter.
 
 ## Agent internals
 

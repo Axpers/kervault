@@ -1,4 +1,4 @@
-"""Command-line interface for pydump."""
+"""Command-line interface for kervault."""
 
 import argparse
 import struct
@@ -8,7 +8,7 @@ import os
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="pydump",
+        prog="kervault",
         description="Remote Windows credential extraction",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""examples:

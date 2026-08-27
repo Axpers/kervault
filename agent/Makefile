@@ -81,15 +81,7 @@ cross: dirs_cross
 	$(CROSS_OBJCOPY) --rename-section .text=.code --rename-section .rdata=.cfg bin/agent.exe 2>/dev/null || true
 	python3 -c "import struct;f=open('bin/agent.exe','r+b');f.seek(0x3c);off=struct.unpack('<I',f.read(4))[0]+8;f.seek(off);f.write(b'\0\0\0\0');f.close()"
 
-cross_ssp: dirs_cross
-	$(CROSS_CC) $(CROSS_CFLAGS) -c src/ssp.c -o build/ssp.o
-	$(CROSS_CC) -shared -nostdlib -nostartfiles -o bin/ssp.dll build/ssp.o -s -Wl,-e,DllMain
-	$(CROSS_OBJCOPY) --remove-section .comment bin/ssp.dll 2>/dev/null || true
-	python3 -c "import struct;f=open('bin/ssp.dll','r+b');f.seek(0x3c);off=struct.unpack('<I',f.read(4))[0]+8;f.seek(off);f.write(b'\0\0\0\0');f.close()"
-
-cross_all: cross cross_ssp
-
 dirs_cross:
 	@mkdir -p build bin
 
-.PHONY: all clean cross cross_ssp cross_all dirs dirs_cross
+.PHONY: all clean cross dirs dirs_cross

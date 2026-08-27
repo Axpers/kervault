@@ -117,7 +117,7 @@ agent/                  ~44KB x64 PE, MinGW cross-compiled
 ├── src/
 │   ├── main.c          Entry, service stub (mode 16), BYOVD orchestration, self-delete
 │   ├── byovd.c         BYOVD driver interface — ETW-Ti disable, kernel R/W, direct process read
-│   ├── syscalls.c      Hell's Gate SSN resolution, ETW patch
+│   ├── syscalls.c      Hell's Gate SSN resolution
 │   ├── syscalls_gas.S  Indirect syscall stubs (GAS, 4 variants by arg count)
 │   ├── syscalls.asm    Indirect syscall stubs (MASM, for MSVC builds)
 │   ├── registry.c      Hive file reading — raw NTFS volume access
@@ -132,9 +132,7 @@ agent/                  ~44KB x64 PE, MinGW cross-compiled
 │   ├── agent.h         MDMP structures
 │   └── ntdefs.h        NT type definitions, ACL/ACE structs
 └── drivers/
-    ├── KKYUM.sys        Signed kernel driver — MmCopyVirtualMemory (primary)
-    ├── signeddrv.sys    Fallback driver — .data section R/W only
-    └── RTCore64.sys     Fallback driver — MSI Afterburner
+    └── KKYUM.sys        Signed kernel driver — MmCopyVirtualMemory
 ```
 
 ## Installation
@@ -177,7 +175,7 @@ At least one flag is required. All of them can be combined, order doesn't matter
 |---|---|
 | Indirect syscalls | SSN resolved via Hell's Gate / Halo's Gate from ntdll PEB walk |
 | Call stack spoofing | Synthetic ntdll return frame — `sub rsp,8` + `ret` gadget at [rsp] creates a double-ret chain through ntdll, masking the real caller |
-| Stub variants | 4 asm stubs (0/2/7/10 stack shifts) matching NT arg counts — prevents stack corruption |
+| Stub variants | 3 asm stubs (0/2/7 stack shifts) matching NT arg counts — prevents stack corruption |
 | API hashing | All Nt* exports resolved by DJB2 hash — zero plaintext function names |
 | BYOVD kernel driver | KKYUM.sys loaded as kernel service — MmCopyVirtualMemory for arbitrary cross-process reads |
 | ETW-Ti disable | EtwThreatIntProvRegHandle zeroed via kernel write — kills telemetry pipeline |
@@ -188,7 +186,6 @@ At least one flag is required. All of them can be combined, order doesn't matter
 | NtGetNextProcess | Handle acquisition without CLIENT_ID — no NtOpenProcess on LSASS |
 | Raw NTFS reads | Hive files read from raw disk clusters — bypasses kernel file locks, DACLs, and EDR file filters |
 | Pure NT syscalls | No Win32 API — registry, pipes, files, all via Nt* syscalls |
-| ETW patch | `EtwEventWrite` overwritten with `xor eax,eax; ret` via `NtProtectVirtualMemory` |
 | Wire encryption | Rolling XOR cipher keyed on output name — no plaintext signatures on disk |
 | Restricted DACL | Pipe access limited to SYSTEM + BUILTIN\Administrators (no NULL DACL) |
 | Self-delete | ADS rename + `FileDispositionInfo` — binary removed before `ExitProcess` |
@@ -196,7 +193,7 @@ At least one flag is required. All of them can be combined, order doesn't matter
 | Frame pointer omission | `-fomit-frame-pointer` — RBP-based stack walkers cannot trace frames |
 | TSCH execution | Hive agent launched via scheduled task (MS-TSCH RPC), not SVCCTL — avoids Event 7045 |
 | Stealth naming | Task path/service/agent names mimic legitimate Windows components |
-| No CRT | `-nostdlib -nostartfiles`, ~12KB binary |
+| No CRT | `-nostdlib -nostartfiles`, ~44KB binary |
 
 ## Requirements
 

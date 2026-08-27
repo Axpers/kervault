@@ -143,11 +143,10 @@ agent/                  ~44KB x64 PE, MinGW cross-compiled
 virtualenv env && source env/bin/activate && pip install -r requirements.txt
 ```
 
-# Build agent (requires x86_64-w64-mingw32-gcc)
+Build agent (requires x86_64-w64-mingw32-gcc)
+```
 cd agent && make cross
 ```
-
-Dependencies: `smbprotocol` + `pycryptodome`.
 
 ## Usage
 

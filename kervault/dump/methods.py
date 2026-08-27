@@ -405,7 +405,7 @@ class PipeDump:
                 print(f"    [dbg] BYOVD: FAILED at {desc}")
                 offset += 4
             if offset + 32 <= len(data):
-                dbg_size = 64 if offset + 64 <= len(data) else 32
+                dbg_size = 32
                 print(f"    [dbg] raw: {data[offset:offset+dbg_size].hex()}")
                 nbase, rva, elev, oldv, newv = struct.unpack_from(
                     "<QIIQ Q", data, offset)
